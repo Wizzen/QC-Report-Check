@@ -1,0 +1,8 @@
+Case 1: 材料一致 - requirement Q355B / actual Q355B
+Case 2: 材料牌号不一致 - requirement Q355B / actual Q235B
+Case 3: 抗拉强度低于要求 - requirement >=470 MPa / actual 455 MPa
+Case 4: 化学元素超标 - requirement P<=0.035% / actual 0.041%
+Case 5: 必检项目缺失 - required 冲击试验 / actual missing
+Case 6: 两个文件炉号不一致 - H240812 / H240821
+Case 7: 没有找到相关标准 - no extracted requirement -> Review
+

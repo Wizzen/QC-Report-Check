@@ -1,0 +1,23 @@
+[theme]
+base = "light"
+primaryColor = "#111827"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f7f8fa"
+textColor = "#111827"
+linkColor = "#2563eb"
+borderColor = "#e5e7eb"
+showWidgetBorder = true
+baseRadius = "0.75rem"
+buttonRadius = "0.75rem"
+font = "sans-serif"
+headingFont = "sans-serif"
+codeFont = "monospace"
+
+[server]
+address = "127.0.0.1"
+port = 8501
+maxUploadSize = 100
+
+[browser]
+gatherUsageStats = false
+

@@ -1,0 +1,16 @@
+ollama:
+  base_url: "http://127.0.0.1:11434"
+  llm_model: ""
+  embedding_model: "bge-m3"
+
+storage:
+  database: "./data/database/app.db"
+  database_v2: "./data/database/qaqc_v2.db"
+  standards: "./data/standards"
+  uploads: "./data/uploads"
+  vector_db: "./data/vector_db"
+  exports: "./data/exports"
+
+audit:
+  confidence_threshold: 0.70
+  max_upload_mb: 100
