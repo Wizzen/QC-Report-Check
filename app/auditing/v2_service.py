@@ -4,15 +4,25 @@ import hashlib
 import json
 import logging
 import mimetypes
+import re
 import shutil
 from io import BytesIO
 from pathlib import Path
 from typing import BinaryIO, Iterable
 from urllib.parse import urlsplit
 
+from app.auditing.expert_review import (
+    FASTENER_REQUIRED_CHECKS,
+    FASTENER_REVIEW_INSTRUCTIONS,
+    FASTENER_TEMPLATE_NAME,
+    ExpertDocument,
+    build_expert_prompt,
+    deterministic_fastener_audit,
+    findings_from_llm,
+)
 from app.database import ReviewDatabase
 from app.database.v2 import utcnow
-from app.extractors import extract_items, extract_requirements
+from app.extractors import extract_filename_items, extract_items, extract_requirements
 from app.integrations import ConfigStore, LLMClient, MinerUClient
 from app.models import ExtractedItem, Finding, PageText, Requirement
 from app.parsers import parse_document
@@ -31,6 +41,24 @@ class ReviewService:
         self.db, self.config_store = db, config_store
         self.uploads, self.standards, self.vector_root = uploads, standards, vector_root
         self.max_bytes = max_upload_mb * 1024 * 1024
+        self._ensure_fastener_template()
+
+    def _ensure_fastener_template(self) -> None:
+        row = self.db.one("SELECT id FROM audit_templates WHERE name=?", (FASTENER_TEMPLATE_NAME,))
+        if row:
+            self.db.execute(
+                "UPDATE audit_templates SET review_instructions=?,required_document_types=?,required_items=? WHERE id=?",
+                (FASTENER_REVIEW_INSTRUCTIONS, json.dumps(["COC", "COI/MTR"], ensure_ascii=False),
+                 json.dumps(FASTENER_REQUIRED_CHECKS, ensure_ascii=False), row["id"]),
+            )
+            return
+        self.db.execute(
+            """INSERT INTO audit_templates(name,description,required_document_types,required_items,review_instructions,
+               enabled,is_default,created_at) VALUES(?,?,?,?,?,1,0,?)""",
+            (FASTENER_TEMPLATE_NAME, "按文件/WDC关系、表格实测数据和逐页证据审核 CUSTOMER 紧固件质量文件。",
+             json.dumps(["COC", "COI/MTR"], ensure_ascii=False),
+             json.dumps(FASTENER_REQUIRED_CHECKS, ensure_ascii=False), FASTENER_REVIEW_INSTRUCTIONS, utcnow()),
+        )
 
     def create_review(self, template_id: int | None, selected_basis: list[str],
                       supplier_files: Iterable[object], supplemental_files: Iterable[object]) -> str:
@@ -92,10 +120,10 @@ class ReviewService:
                            activity="正在比较实测值、单位、材料及必检项目", resource="本机 CPU · 确定性规则引擎")
             findings = self._audit(batch_id)
             settings = self.config_store.get()
-            self._activity(batch_id, stage="生成问题说明", progress=82,
-                           activity=f"准备为 {len(findings)} 个问题生成可读说明",
+            self._activity(batch_id, stage="LLM 专家复核", progress=82,
+                           activity=f"准备让 LLM 基于逐页证据复核 {len(findings)} 个规则结果并发现遗漏",
                            resource=_resource("LLM", settings.llm_base_url, settings.llm_model))
-            findings = self._explain(batch_id, findings)
+            findings = self._expert_review(batch_id, findings)
             self._activity(batch_id, stage="保存审核结果", progress=97,
                            activity="正在写入问题证据、判断逻辑和审核汇总", resource="SQLite 本地数据库")
             with self.db.connect() as connection:
@@ -133,21 +161,29 @@ class ReviewService:
             self._activity(batch_id, activity=f"正在读取 {row['original_name']} 的本地文本层",
                            resource="本机 CPU · PyMuPDF/python-docx/openpyxl")
             if path.suffix.lower() in {".jpg", ".jpeg", ".png"}:
-                raise ValueError("图像需要 OCR")
-            pages = parse_document(path)
-            text_chars = sum(len(page.text.strip()) for page in pages)
-            if path.suffix.lower() == ".pdf" and text_chars < max(80, len(pages) * 30):
-                raise ValueError("PDF 文本层内容不足")
-        except ValueError as exc:
+                pages = [PageText(1, "")]
+            else:
+                pages = parse_document(path)
+        except ValueError:
             if path.suffix.lower() not in {".pdf", ".jpg", ".jpeg", ".png"}:
                 raise
-            if not settings.ocr_base_url:
-                raise RuntimeError(f"{exc}，且未配置 OCR 服务") from exc
+            pages = [PageText(1, "")]
+        ocr_capable = path.suffix.lower() in {".pdf", ".jpg", ".jpeg", ".png"}
+        sparse_pages = [page.page for page in pages if ocr_capable and len(re.sub(r"\s+", "", page.text)) < 40]
+        if sparse_pages and settings.ocr_base_url:
             self._activity(batch_id, activity=f"正在提交 {row['original_name']} 并等待 OCR 识别结果",
                            resource=_resource("OCR", settings.ocr_base_url, settings.ocr_backend))
-            markdown = MinerUClient(settings).ocr(path)
-            pages = [PageText(1, markdown)]
-            ocr_status = "completed"
+            try:
+                markdown = MinerUClient(settings).ocr(path)
+                pages = _merge_ocr_text(pages, markdown, sparse_pages)
+                ocr_status = "completed"
+            except Exception as exc:
+                LOGGER.warning("逐页 OCR 不可用，保留已有文本并标记人工复核：%s", type(exc).__name__)
+                ocr_status = "failed"
+                self._activity(batch_id, activity=f"OCR 未完成；保留 {row['original_name']} 已提取页面并标记空白页",
+                               resource=_resource("OCR", settings.ocr_base_url, settings.ocr_backend))
+        elif sparse_pages:
+            ocr_status = "pending"
         raw_text = "\n\n".join(page.text for page in pages)
         self._activity(batch_id, activity=f"正在从 {row['original_name']} 提取结构化字段和审核条款",
                        resource="本机 CPU · 正则提取器")
@@ -155,7 +191,7 @@ class ReviewService:
             connection.execute("DELETE FROM extracted_data WHERE document_id=?", (document_id,))
             connection.execute("DELETE FROM requirement_rules WHERE document_id=?", (document_id,))
             if row["library_code"] == "supplier":
-                items = extract_items(pages)
+                items = [*extract_items(pages), *extract_filename_items(row["original_name"])]
                 connection.executemany(
                     """INSERT INTO extracted_data(document_id,key,raw_value,normalized_value,unit,page,source_text,category)
                        VALUES(?,?,?,?,?,?,?,?)""",
@@ -186,7 +222,7 @@ class ReviewService:
 
     def _audit(self, batch_id: str) -> list[Finding]:
         document_rows = self.db.query(
-            """SELECT d.id,d.original_name FROM batch_documents bd JOIN documents d ON d.id=bd.document_id
+            """SELECT d.id,d.original_name,d.stored_path,d.page_text,d.ocr_status FROM batch_documents bd JOIN documents d ON d.id=bd.document_id
                WHERE bd.batch_id=? AND bd.role='supplier'""", (batch_id,)
         )
         documents: dict[str, list[ExtractedItem]] = {}
@@ -210,22 +246,54 @@ class ReviewService:
             _optional_float(row["upper_value"]), row["unit"], row["raw"], row["source_file"], row["source_page"],
             row["clause"], bool(row["required"])) for row in rule_rows]
         batch = self.db.one("SELECT template_id FROM review_batches WHERE id=?", (batch_id,))
-        if batch and batch["template_id"]:
-            template = self.db.one("SELECT required_items FROM audit_templates WHERE id=?", (batch["template_id"],))
-            if template:
-                for item in json.loads(template["required_items"] or "[]"):
-                    if not any(req.item == item and req.operator == "exists" for req in requirements):
-                        requirements.append(Requirement(str(item), "exists", None, raw=f"审核模板必检项：{item}", required=True))
+        template = self.db.one("SELECT * FROM audit_templates WHERE id=?", (batch["template_id"],)) if batch and batch["template_id"] else None
         findings = AuditEngine().audit(documents, requirements)
-        if not rule_rows:
+        if template and template["name"] == FASTENER_TEMPLATE_NAME:
+            expert_documents = [_expert_document(row) for row in document_rows]
+            findings.extend(deterministic_fastener_audit(expert_documents))
+        if not rule_rows and not (template and template.get("review_instructions", "").strip()):
             findings.append(Finding("待人工确认", "Review", "审核依据", "没有找到明确的结构化审核依据，系统未推测合格性",
                                     requirement="缺少明确审核依据", logic="所选依据未提取出可执行规则"))
-        return findings
+        return _dedupe_findings(findings)
+
+    def _expert_review(self, batch_id: str, findings: list[Finding]) -> list[Finding]:
+        settings = self.config_store.get()
+        if not settings.llm_base_url:
+            self._activity(batch_id, activity="未配置 LLM Base URL，保留确定性专家规则结果", resource="本机规则引擎")
+            return findings
+        rows = self.db.query(
+            """SELECT d.original_name,d.stored_path,d.page_text,d.ocr_status FROM batch_documents bd
+               JOIN documents d ON d.id=bd.document_id WHERE bd.batch_id=? AND bd.role='supplier'""", (batch_id,)
+        )
+        documents = [_expert_document(row) for row in rows]
+        if not documents:
+            return findings
+        batch = self.db.one("SELECT template_id FROM review_batches WHERE id=?", (batch_id,))
+        template = self.db.one("SELECT review_instructions FROM audit_templates WHERE id=?", (batch["template_id"],)) if batch and batch["template_id"] else None
+        instructions = str(template.get("review_instructions") or "") if template else ""
+        basis_rows = self.db.query(
+            """SELECT d.original_name,d.raw_text FROM batch_documents bd JOIN documents d ON d.id=bd.document_id
+               WHERE bd.batch_id=? AND bd.role IN ('selected_basis','supplemental_basis') ORDER BY bd.priority""", (batch_id,)
+        )
+        basis = "\n".join(f"[依据={row['original_name']}]\n{row['raw_text']}" for row in basis_rows)
+        self._activity(batch_id, activity="正在调用 LLM 逐页复核文件类型、追溯关系和表格证据",
+                       resource=_resource("LLM", settings.llm_base_url, settings.llm_model))
+        try:
+            payload = LLMClient(settings).generate_json(build_expert_prompt(documents, instructions, findings, basis))
+            discovered = findings_from_llm(payload, documents)
+            self._activity(batch_id, progress=94, activity=f"LLM 专家复核新增 {len(discovered)} 个有原页证据的问题",
+                           resource=_resource("LLM", settings.llm_base_url, settings.llm_model))
+            return _dedupe_findings([*findings, *discovered])
+        except Exception as exc:
+            LOGGER.warning("LLM 专家复核失败，保留确定性结果：%s", type(exc).__name__)
+            self._activity(batch_id, progress=94, activity="LLM 专家复核未完成，已保留确定性规则结果",
+                           resource=_resource("LLM", settings.llm_base_url, settings.llm_model))
+            return findings
 
     def _explain(self, batch_id: str, findings: list[Finding]) -> list[Finding]:
         settings = self.config_store.get()
-        if not settings.llm_model or not findings:
-            self._activity(batch_id, activity="未配置 LLM，保留确定性规则生成的说明",
+        if not settings.llm_base_url or not findings:
+            self._activity(batch_id, activity="未配置 LLM Base URL，保留确定性规则生成的说明",
                            resource="本机规则引擎")
             return findings
         client = LLMClient(settings)
@@ -283,3 +351,42 @@ def _resource(kind: str, base_url: str, model: str) -> str:
     host = urlsplit(base_url).netloc or base_url
     detail = model.strip() or "未指定模型"
     return f"{kind} · {detail} · {host}"
+
+
+def _merge_ocr_text(pages: list[PageText], markdown: str, sparse_pages: list[int]) -> list[PageText]:
+    """Preserve good text-layer pages and attach OCR output to pages that were empty."""
+    if not sparse_pages:
+        return pages
+    target = sparse_pages[0]
+    output: list[PageText] = []
+    for page in pages:
+        if page.page == target:
+            merged = "\n\n".join(part for part in (page.text.strip(), "[OCR]\n" + markdown.strip()) if part.strip())
+            output.append(PageText(page.page, merged))
+        else:
+            output.append(page)
+    return output
+
+
+def _expert_document(row: dict[str, object]) -> ExpertDocument:
+    try:
+        payload = json.loads(str(row.get("page_text") or "[]"))
+    except json.JSONDecodeError:
+        payload = []
+    pages = [PageText(int(item.get("page", 1)), str(item.get("text", ""))) for item in payload if isinstance(item, dict)]
+    if not pages:
+        pages = [PageText(1, "")]
+    return ExpertDocument(str(row.get("original_name") or "未命名文件"), Path(str(row.get("stored_path") or "")),
+                          pages, str(row.get("ocr_status") or "not_needed"))
+
+
+def _dedupe_findings(items: list[Finding]) -> list[Finding]:
+    seen: set[tuple[str, str, int, str]] = set()
+    output: list[Finding] = []
+    for item in items:
+        key = (item.category, item.source_file, item.source_page,
+               re.sub(r"\s+", "", item.source_text or item.actual).casefold())
+        if key not in seen:
+            seen.add(key)
+            output.append(item)
+    return output

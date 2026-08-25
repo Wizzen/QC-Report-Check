@@ -70,18 +70,30 @@ def test_service_presets_keep_keys_encrypted_and_can_be_applied(tmp_path: Path) 
     assert restored.llm_api_key == "preset-secret"
 
 
-def test_llm_test_reports_connected_service_without_models(tmp_path: Path) -> None:
+def test_llm_ping_reports_reachable_service(tmp_path: Path) -> None:
     settings = _store(tmp_path).get()
     response = Mock()
+    response.status_code = 200
     response.raise_for_status.return_value = None
-    response.json.return_value = {"object": "list", "data": None}
+
+    with patch("app.integrations.clients.requests.get", return_value=response):
+        result = LLMClient(settings).ping()
+
+    assert result["ok"] is True
+    assert result["detail"] == "连接成功"
+
+
+def test_llm_test_without_model_skips_json_probe(tmp_path: Path) -> None:
+    settings = _store(tmp_path).save({"llm_model": ""})
+    response = Mock()
+    response.status_code = 200
+    response.raise_for_status.return_value = None
 
     with patch("app.integrations.clients.requests.get", return_value=response):
         result = LLMClient(settings).test()
 
-    assert result["ok"] is False
-    assert "服务连接正常" in result["detail"]
-    assert "没有可用模型" in result["detail"]
+    assert result["ok"] is True
+    assert "默认模型" in result["detail"]
 
 
 def test_llm_json_request_uses_broad_openai_compatible_payload(tmp_path: Path) -> None:
@@ -94,4 +106,6 @@ def test_llm_json_request_uses_broad_openai_compatible_payload(tmp_path: Path) -
         result = LLMClient(settings).generate_json("test", retries=0)
 
     assert result == {"ok": True}
-    assert "response_format" not in request.call_args.kwargs["json"]
+    payload = request.call_args.kwargs["json"]
+    assert payload["model"] == "qwen-test"
+    assert "response_format" not in payload

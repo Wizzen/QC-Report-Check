@@ -37,10 +37,28 @@ def _parse_pdf(path: Path) -> list[PageText]:
         if document.needs_pass:
             raise ValueError("PDF 已加密，无法解析")
         for number, page in enumerate(document, start=1):
-            pages.append(PageText(number, page.get_text("text", sort=True).strip()))
-    if not any(page.text for page in pages):
-        raise ValueError("PDF 没有可提取文本，可能是扫描件；MVP 请人工确认或在第二阶段使用 OCR")
+            text = page.get_text("text", sort=True).strip()
+            table_text = _extract_pdf_tables(page)
+            if table_text:
+                text = f"{text}\n\n{table_text}".strip()
+            pages.append(PageText(number, text))
     return pages
+
+
+def _extract_pdf_tables(page: pymupdf.Page) -> str:
+    """Keep row relationships that plain PDF text extraction usually destroys."""
+    try:
+        tables = page.find_tables().tables
+    except Exception as exc:
+        LOGGER.warning("PDF 表格识别失败，保留普通文本：%s", type(exc).__name__)
+        return ""
+    lines: list[str] = []
+    for table in tables:
+        for row in table.extract():
+            cells = [" ".join(str(cell).split()) for cell in row if cell and str(cell).strip()]
+            if cells:
+                lines.append("[TABLE_ROW] " + " || ".join(cells))
+    return "\n".join(lines)
 
 
 def _parse_docx(path: Path) -> list[PageText]:

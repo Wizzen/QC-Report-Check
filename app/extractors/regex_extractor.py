@@ -13,6 +13,7 @@ LABELS: dict[str, list[str]] = {
     "po_number": ["PO号", "采购订单号", "PO No"],
     "drawing_number": ["图号", "Drawing No"],
     "product_model": ["型号", "Model"],
+    "wdc_number": ["WDC", "WDC No", "WDC号"],
 }
 
 TEST_ALIASES: dict[str, list[str]] = {
@@ -49,6 +50,18 @@ def extract_items(pages: list[PageText]) -> list[ExtractedItem]:
                 raw = (match.group(1) + (f" {match.group(2)}" if match.group(2) else "")).strip()
                 _append(results, seen, ExtractedItem(item, raw, float(match.group(1)), match.group(2) or "",
                         page.page, _line(page.text, match.start()), "measurement"))
+    return results
+
+
+def extract_filename_items(filename: str) -> list[ExtractedItem]:
+    """Recover traceability identifiers intentionally encoded in supplier filenames."""
+    results: list[ExtractedItem] = []
+    for match in re.finditer(r"(?<!\d)(\d{4}[\s_-]?\d{6}|\d{10}|\d{8})(?!\d)", filename):
+        raw = match.group(1)
+        normalized = re.sub(r"\D", "", raw)
+        if len(normalized) in {8, 10}:
+            results.append(ExtractedItem("wdc_number", raw, normalized, page=1,
+                                         source_text=f"文件名：{filename}", category="identity"))
     return results
 
 

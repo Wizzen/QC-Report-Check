@@ -8,6 +8,7 @@ __pycache__/
 .streamlit/*
 !.streamlit/config.toml
 data/database/*.db*
+data/database/backups/
 data/projects/*
 data/standards/*
 data/uploads/*
@@ -19,3 +20,4 @@ logs/*
 .app.pid
 .app-pids.json
 data/secrets/
+tmp/

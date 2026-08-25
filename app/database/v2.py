@@ -18,7 +18,7 @@ CREATE TABLE IF NOT EXISTS document_libraries (
 CREATE TABLE IF NOT EXISTS audit_templates (
   id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE,
   description TEXT NOT NULL DEFAULT '', required_document_types TEXT NOT NULL DEFAULT '[]',
-  required_items TEXT NOT NULL DEFAULT '[]', enabled INTEGER NOT NULL DEFAULT 1,
+  required_items TEXT NOT NULL DEFAULT '[]', review_instructions TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL DEFAULT 1,
   is_default INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS review_batches (
@@ -92,7 +92,7 @@ CREATE TABLE IF NOT EXISTS review_history (
 );
 CREATE TABLE IF NOT EXISTS service_config (
   id INTEGER PRIMARY KEY CHECK(id=1), allow_remote INTEGER NOT NULL DEFAULT 0,
-  llm_base_url TEXT NOT NULL DEFAULT 'http://127.0.0.1:11434/v1', llm_api_key TEXT NOT NULL DEFAULT '',
+  llm_base_url TEXT NOT NULL DEFAULT 'http://127.0.0.1:8080/v1', llm_api_key TEXT NOT NULL DEFAULT '',
   llm_model TEXT NOT NULL DEFAULT '', llm_temperature REAL NOT NULL DEFAULT 0.2,
   embedding_base_url TEXT NOT NULL DEFAULT 'http://127.0.0.1:11434/v1', embedding_api_key TEXT NOT NULL DEFAULT '',
   embedding_model TEXT NOT NULL DEFAULT 'bge-m3:latest', embedding_dimensions INTEGER NOT NULL DEFAULT 1024,
@@ -147,6 +147,9 @@ class ReviewDatabase:
             }.items():
                 if name not in columns:
                     connection.execute(f"ALTER TABLE review_batches ADD COLUMN {name} {declaration}")
+            template_columns = {row[1] for row in connection.execute("PRAGMA table_info(audit_templates)").fetchall()}
+            if "review_instructions" not in template_columns:
+                connection.execute("ALTER TABLE audit_templates ADD COLUMN review_instructions TEXT NOT NULL DEFAULT ''")
             connection.executemany(
                 "INSERT OR IGNORE INTO document_libraries(code,name,description) VALUES(?,?,?)",
                 [

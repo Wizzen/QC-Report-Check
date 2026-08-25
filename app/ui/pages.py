@@ -20,7 +20,7 @@ def start_review_page() -> None:
     settings = ctx.config_store.get()
     transport = '<span class="qaqc-badge remote">外部服务已启用</span>' if settings.uses_remote else '<span class="qaqc-badge">本机 / 局域网服务</span>'
     st.html(f"""<section class="qaqc-hero"><h1>上传质量文件，<br>把问题和依据一次找全</h1>
-      <p>选择审核模板和依据，上传供应商文件。程序规则负责数值与一致性判断，AI 只解释有证据的结果。</p>
+      <p>选择审核模板和依据，上传供应商文件。程序先做逐页 OCR 与表格规则检查，再由 AI 基于原页证据复核遗漏。</p>
       <div class="qaqc-privacy">所有文件默认保留在本机　{transport}</div></section>""")
     templates = ctx.db.query("SELECT * FROM audit_templates WHERE enabled=1 ORDER BY is_default DESC,name")
     template_options = {row["name"]: row["id"] for row in templates}
@@ -262,6 +262,12 @@ def templates_page() -> None:
         name = st.text_input("模板名称", value=selected["name"] if selected else "")
         description = st.text_area("说明", value=selected["description"] if selected else "")
         required = st.text_area("必检项目（每行一个）", value="\n".join(json.loads(selected["required_items"] or "[]")) if selected else "")
+        instructions = st.text_area(
+            "专家审核说明",
+            value=str(selected.get("review_instructions") or "") if selected else "",
+            height=260,
+            help="这里保存判断规则和提示说明，不会再把每一行误当成供应商报告中必须出现的字段。",
+        )
         default_basis = st.multiselect("默认审核依据", list(basis_labels), default=[label for label, doc_id in basis_labels.items() if doc_id in attached])
         enabled = st.toggle("启用", value=bool(selected["enabled"]) if selected else True)
         is_default = st.toggle("设为默认模板", value=bool(selected["is_default"]) if selected else False)
@@ -272,11 +278,11 @@ def templates_page() -> None:
                 items = [line.strip() for line in required.splitlines() if line.strip()]
                 if selected:
                     template_id = selected["id"]
-                    ctx.db.execute("UPDATE audit_templates SET name=?,description=?,required_items=?,enabled=?,is_default=? WHERE id=?",
-                                   (name.strip(), description.strip(), json.dumps(items, ensure_ascii=False), int(enabled), int(is_default), template_id))
+                    ctx.db.execute("UPDATE audit_templates SET name=?,description=?,required_items=?,review_instructions=?,enabled=?,is_default=? WHERE id=?",
+                                   (name.strip(), description.strip(), json.dumps(items, ensure_ascii=False), instructions.strip(), int(enabled), int(is_default), template_id))
                 else:
-                    template_id = ctx.db.execute("""INSERT INTO audit_templates(name,description,required_document_types,required_items,enabled,is_default,created_at)
-                        VALUES(?,?,?, ?,?,?,datetime('now'))""", (name.strip(), description.strip(), "[]", json.dumps(items, ensure_ascii=False), int(enabled), int(is_default)))
+                    template_id = ctx.db.execute("""INSERT INTO audit_templates(name,description,required_document_types,required_items,review_instructions,enabled,is_default,created_at)
+                        VALUES(?,?,?,?,?,?,?,datetime('now'))""", (name.strip(), description.strip(), "[]", json.dumps(items, ensure_ascii=False), instructions.strip(), int(enabled), int(is_default)))
                 if is_default:
                     ctx.db.execute("UPDATE audit_templates SET is_default=0 WHERE id<>?", (template_id,))
                 with ctx.db.connect() as connection:
@@ -308,7 +314,7 @@ def settings_page() -> None:
         st.subheader("LLM 大模型")
         llm_url = st.text_input("LLM Base URL", current.llm_base_url)
         llm_key = st.text_input("LLM API Key", mask_secret(current.llm_api_key), type="password")
-        llm_model = st.text_input("LLM 模型", current.llm_model, placeholder="例如 qwen3:8b")
+        llm_model = st.text_input("LLM 模型", current.llm_model, placeholder="留空则使用服务端默认模型，例如 Qwen3.8-27B-4bit")
         llm_temp = st.number_input("温度", 0.0, 2.0, current.llm_temperature, 0.1)
         st.subheader("向量模型")
         emb_url = st.text_input("Embedding Base URL", current.embedding_base_url)
@@ -340,20 +346,6 @@ def settings_page() -> None:
     if st.button("一键测试全部服务", type="primary", icon=":material/network_check:", width="stretch"):
         _test_all_services(ctx.config_store.get())
     with st.container(horizontal=True):
-        if st.button("发现 LLM 模型", icon=":material/search:"):
-            with st.spinner("正在读取服务端模型列表…"):
-                try:
-                    models = LLMClient(ctx.config_store.get()).models()
-                    if not models:
-                        st.warning("LLM 服务已连接，但服务端没有可用模型。程序不会自动下载模型。")
-                    elif ctx.config_store.get().llm_model not in models:
-                        ctx.config_store.save({"llm_model": models[0]})
-                        st.success(f"发现 {len(models)} 个模型，已回填服务端真实模型 ID：{models[0]}")
-                        st.rerun()
-                    else:
-                        st.info("可用模型：" + "、".join(models))
-                except Exception as exc:
-                    st.error(f"读取模型列表失败：{exc}")
         if st.button("测试 LLM", icon=":material/smart_toy:"):
             _show_test(lambda: LLMClient(ctx.config_store.get()).test())
         if st.button("测试向量", icon=":material/hub:"):

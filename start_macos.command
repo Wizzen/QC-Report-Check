@@ -10,20 +10,43 @@ pause_on_error() {
 }
 trap pause_on_error ERR
 
-if ! command -v python3 >/dev/null 2>&1; then
-  printf 'Python 3 was not found. Install Python 3.11 or newer from python.org first.\n'
+export PATH="$HOME/.local/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"
+
+find_python311() {
+  local candidate
+  for candidate in python3.13 python3.12 python3.11 python3; do
+    if command -v "$candidate" >/dev/null 2>&1 \
+      && "$candidate" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null; then
+      command -v "$candidate"
+      return 0
+    fi
+  done
+  for candidate in \
+    "$HOME/.local/bin/python3.13" \
+    "$HOME/.local/bin/python3.12" \
+    "$HOME/.local/bin/python3.11" \
+    "/usr/local/bin/python3" \
+    "/opt/homebrew/bin/python3"; do
+    if [ -x "$candidate" ] \
+      && "$candidate" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+PYTHON="$(find_python311 || true)"
+if [ -z "$PYTHON" ]; then
+  printf 'Python 3.11 or newer was not found. Install it from python.org or ensure python3.12 is on PATH.\n'
   exit 1
 fi
-
-python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' || {
-  printf 'Python 3.11 or newer is required.\n'
-  exit 1
-}
+printf 'Using Python: %s (%s)\n' "$PYTHON" "$("$PYTHON" --version 2>&1)"
 
 MAC_VENV="$PROJECT_DIR/.venv-macos"
 if [ ! -x "$MAC_VENV/bin/python" ]; then
   printf 'Creating the macOS virtual environment...\n'
-  python3 -m venv "$MAC_VENV"
+  "$PYTHON" -m venv "$MAC_VENV"
 fi
 
 REQ_HASH="$(shasum -a 256 requirements.txt | awk '{print $1}')"
@@ -37,6 +60,8 @@ if [ "$REQ_HASH" != "$INSTALLED_HASH" ]; then
 fi
 
 export PYTHONUTF8=1
+export STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
+export STREAMLIT_SERVER_HEADLESS=true
 (sleep 4 && open 'http://127.0.0.1:8501') &
 printf 'Starting Supplier Quality AI at http://127.0.0.1:8501\n'
 printf 'Keep this Terminal window open. Press Control-C to stop the app.\n\n'

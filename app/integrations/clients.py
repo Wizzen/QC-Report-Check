@@ -6,7 +6,6 @@ import mimetypes
 import re
 import time
 import uuid
-from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -20,7 +19,10 @@ LOGGER = logging.getLogger(__name__)
 
 
 def _headers(api_key: str) -> dict[str, str]:
-    return {"Authorization": f"Bearer {api_key or 'local-no-key'}", "Content-Type": "application/json"}
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    return headers
 
 
 class LLMClient:
@@ -28,45 +30,74 @@ class LLMClient:
         self.settings = settings
         ensure_url_allowed(settings.llm_base_url, settings.allow_remote)
 
+    def ping(self) -> dict[str, Any]:
+        try:
+            response = requests.get(
+                f"{self.settings.llm_base_url}/models",
+                headers=_headers(self.settings.llm_api_key),
+                timeout=10,
+            )
+            if response.status_code == 200:
+                return {"ok": True, "detail": "连接成功"}
+            if response.status_code == 404:
+                return {"ok": True, "detail": "服务可达（无 /models 列表端点）"}
+            if response.status_code in (401, 403):
+                return {"ok": False, "detail": f"密钥无效或无权限（HTTP {response.status_code}）"}
+            response.raise_for_status()
+            return {"ok": False, "detail": f"HTTP {response.status_code}"}
+        except requests.RequestException as exc:
+            return {"ok": False, "detail": f"连接失败：{type(exc).__name__}"}
+
     def test(self) -> dict[str, Any]:
+        ping = self.ping()
+        if not ping["ok"]:
+            return ping
         model = self.settings.llm_model.strip()
         if not model:
-            models = self.models()
-            if not models:
-                return {"ok": False, "detail": "LLM 服务连接正常，但服务端没有可用模型。请先安装或部署模型。"}
-            model = models[0]
-        client = self if model == self.settings.llm_model else LLMClient(replace(self.settings, llm_model=model))
-        result = client.generate_json("只返回 JSON：{\"ok\":true}", retries=0)
-        return {"ok": bool(result.get("ok")), "detail": f"模型 {model} 返回有效 JSON"}
-
-    def models(self) -> list[str]:
-        response = requests.get(f"{self.settings.llm_base_url}/models", headers=_headers(self.settings.llm_api_key), timeout=10)
-        response.raise_for_status()
-        data = response.json().get("data") or []
-        return [str(item.get("id", "")) for item in data if item.get("id")]
+            return {"ok": True, "detail": "LLM 服务连接正常（未指定模型，将使用服务端默认模型）"}
+        try:
+            result = self.generate_json('只返回 JSON：{"ok":true}', retries=0)
+            return {"ok": bool(result.get("ok")), "detail": f"模型 {model} 返回有效 JSON"}
+        except Exception as exc:
+            return {"ok": False, "detail": str(exc)}
 
     def generate_json(self, prompt: str, retries: int = 2) -> dict[str, Any]:
-        if not self.settings.llm_model:
-            raise ValueError("LLM 模型名称为空")
         last_error: Exception | None = None
         for attempt in range(retries + 1):
             try:
+                payload: dict[str, Any] = {
+                    "temperature": self.settings.llm_temperature,
+                    "messages": [{"role": "user", "content": prompt + ("\n只输出一个 JSON 对象。" if attempt else "")}],
+                }
+                model = self.settings.llm_model.strip()
+                if model:
+                    payload["model"] = model
                 response = requests.post(
                     f"{self.settings.llm_base_url}/chat/completions",
                     headers=_headers(self.settings.llm_api_key),
-                    json={
-                        "model": self.settings.llm_model,
-                        "temperature": self.settings.llm_temperature,
-                        "messages": [{"role": "user", "content": prompt + ("\n只输出一个 JSON 对象。" if attempt else "")}],
-                    }, timeout=180,
+                    json=payload,
+                    timeout=180,
                 )
                 response.raise_for_status()
-                content = response.json()["choices"][0]["message"]["content"]
-                return parse_json_object(content)
+                body = response.json()
+                content = body["choices"][0]["message"]["content"]
+                if content is None or not str(content).strip():
+                    raise ValueError("LLM 返回空内容")
+                return parse_json_object(str(content))
             except (requests.RequestException, KeyError, ValueError, json.JSONDecodeError) as exc:
                 last_error = exc
-                LOGGER.warning("LLM JSON 响应无效（第 %s 次）: %s", attempt + 1, type(exc).__name__)
-        raise RuntimeError(f"LLM 未返回有效 JSON：{type(last_error).__name__ if last_error else '未知错误'}")
+                detail = type(exc).__name__
+                if isinstance(exc, requests.HTTPError) and exc.response is not None:
+                    body = exc.response.text.strip().replace("\n", " ")[:240]
+                    detail = f"HTTP {exc.response.status_code}: {body or exc.response.reason}"
+                LOGGER.warning("LLM JSON 响应无效（第 %s 次）: %s", attempt + 1, detail)
+        if isinstance(last_error, Exception) and str(last_error):
+            message = str(last_error)
+        elif last_error is not None:
+            message = type(last_error).__name__
+        else:
+            message = "未知错误"
+        raise RuntimeError(f"LLM 未返回有效 JSON：{message}")
 
 
 class EmbeddingClient:
@@ -74,7 +105,30 @@ class EmbeddingClient:
         self.settings = settings
         ensure_url_allowed(settings.embedding_base_url, settings.allow_remote)
 
+    def ping(self) -> dict[str, Any]:
+        try:
+            response = requests.get(
+                f"{self.settings.embedding_base_url}/models",
+                headers=_headers(self.settings.embedding_api_key),
+                timeout=10,
+            )
+            if response.status_code == 200:
+                return {"ok": True, "detail": "连接成功"}
+            if response.status_code == 404:
+                return {"ok": True, "detail": "服务可达（无 /models 列表端点）"}
+            if response.status_code in (401, 403):
+                return {"ok": False, "detail": f"密钥无效或无权限（HTTP {response.status_code}）"}
+            response.raise_for_status()
+            return {"ok": False, "detail": f"HTTP {response.status_code}"}
+        except requests.RequestException as exc:
+            return {"ok": False, "detail": f"连接失败：{type(exc).__name__}"}
+
     def test(self) -> dict[str, Any]:
+        ping = self.ping()
+        if not ping["ok"]:
+            return ping
+        if not self.settings.embedding_model.strip():
+            return {"ok": True, "detail": "Embedding 服务连接正常（未指定模型）"}
         vector = self.embed(["供应商质量文件连接测试"])[0]
         return {"ok": bool(vector), "detail": f"真实向量生成成功，维度 {len(vector)}"}
 

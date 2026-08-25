@@ -1,5 +1,5 @@
 ollama:
-  base_url: "http://127.0.0.1:11434"
+  base_url: "http://127.0.0.1:8080/v1"
   llm_model: ""
   embedding_model: "bge-m3"
 
