@@ -119,11 +119,77 @@ def build_expert_prompt(
 2. evidence 必须逐字摘自对应文件页的原文或 [TABLE_ROW]，不得改写；没有可核验证据就不要输出。
 3. result 只能是“不合格”或“存疑”。page 必须是正整数，source_file 必须与输入文件名完全一致。
 4. 对 Sample/Pass、标准/实测、跨页炉号/规格冲突应逐行核验。
-5. 只返回 JSON：{{"findings":[{{"check_id":"C5","result":"不合格","category":"检测结果不合格","item":"Head Height","description":"...","source_file":"...","page":1,"evidence":"[TABLE_ROW] ...","actual":"...","requirement":"...","logic":"...","suggestion":"...","confidence":0.95}}]}}
+5. 同时识别每份文件的供应商、制造商、材料生产厂或报告出具机构；排除 Customer、Buyer、Purchaser 等采购方。名称必须逐字存在于该文件原文。
+6. 只返回 JSON：{{"documents":[{{"source_file":"报告.pdf","supplier_names":["供应商 A","材料厂 B"]}}],"findings":[{{"check_id":"C5","result":"不合格","category":"检测结果不合格","item":"Head Height","description":"...","source_file":"...","page":1,"evidence":"[TABLE_ROW] ...","actual":"...","requirement":"...","logic":"...","suggestion":"...","confidence":0.95}}]}}
 """
 
 
 FASTENER_FALLBACK_INSTRUCTIONS = "检查文件完整性、可读性、追溯字段一致性，以及文件中明确标准与实测结果的一致性。"
+
+
+_COMPANY_PATTERNS = (
+    re.compile(r"[A-Z0-9][A-Z0-9&'().,\-/ ]{2,}?(?:CO\.?\s*,?\s*LTD\.?|COMPANY\s+LIMITED|LIMITED|CORPORATION|CORP\.?|LLC\b|INC(?:\.|\b))", re.I),
+    re.compile(r"[\u3400-\u9fffA-Za-z0-9（）()·&\-]{2,}(?:有限责任公司|股份有限公司|有限公司|集团公司|检测中心|研究院)"),
+)
+_PARTY_PREFIX = re.compile(
+    r"^(?:supplier|manufacturer|producer|mill|issued\s+by|inspection\s+by|test(?:ing)?\s+laboratory|company|供应商|制造商|生产商|钢厂|出具单位|检测机构)\s*[:：\-]?\s*",
+    re.I,
+)
+_BUYER_CONTEXT = re.compile(r"\b(?:customer|buyer|purchaser|consignee|ship\s+to|sold\s+to)\b|(?:客户|买方|采购方|收货方)", re.I)
+
+
+def extract_supplier_names(documents_or_pages: ExpertDocument | list[PageText]) -> list[str]:
+    """Extract legal entity names from OCR/text as a deterministic fallback."""
+    pages = documents_or_pages.pages if isinstance(documents_or_pages, ExpertDocument) else documents_or_pages
+    names: list[str] = []
+    seen: set[str] = set()
+    for page in pages:
+        for raw_line in page.text.splitlines():
+            line = raw_line.removeprefix("[TABLE_ROW] ").replace(" || ", " ").strip()
+            for pattern in _COMPANY_PATTERNS:
+                for match in pattern.finditer(line):
+                    name = _PARTY_PREFIX.sub("", match.group(0)).strip(" \t:：,;，；-|_")
+                    if "\ufffd" in name:
+                        continue
+                    before = line[:match.start()]
+                    if _BUYER_CONTEXT.search(before) and not _PARTY_PREFIX.search(before):
+                        continue
+                    key = _normal_name(name)
+                    if len(key) < 5 or key in seen:
+                        continue
+                    seen.add(key)
+                    names.append(re.sub(r"\s+", " ", name))
+    return names[:12]
+
+
+def supplier_names_from_llm(payload: dict[str, object], documents: list[ExpertDocument]) -> dict[str, list[str]]:
+    """Accept only LLM names that can be found verbatim (ignoring punctuation) in the source file."""
+    sources = {document.filename: _normal_name(document.text) for document in documents}
+    output: dict[str, list[str]] = {}
+    rows = payload.get("documents")
+    if not isinstance(rows, list):
+        return output
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        filename = str(row.get("source_file") or "")
+        values = row.get("supplier_names")
+        if filename not in sources or not isinstance(values, list):
+            continue
+        accepted: list[str] = []
+        for value in values[:12]:
+            name = re.sub(r"\s+", " ", str(value)).strip(" \t:：,;，；-|_")
+            if "\ufffd" in name:
+                continue
+            normalized = _normal_name(name)
+            if len(normalized) >= 5 and normalized in sources[filename] and normalized not in {_normal_name(item) for item in accepted}:
+                accepted.append(name)
+        output[filename] = accepted
+    return output
+
+
+def _normal_name(value: str) -> str:
+    return re.sub(r"[^0-9a-z\u3400-\u9fff]+", "", value.casefold())
 
 
 def findings_from_llm(payload: dict[str, object], documents: list[ExpertDocument]) -> list[Finding]:

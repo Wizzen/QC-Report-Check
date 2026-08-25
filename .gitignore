@@ -21,3 +21,4 @@ logs/*
 .app-pids.json
 data/secrets/
 tmp/
+output/

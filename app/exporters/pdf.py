@@ -1,0 +1,368 @@
+from __future__ import annotations
+
+import html
+from io import BytesIO
+from pathlib import Path
+
+from reportlab.lib import colors
+from reportlab.lib.enums import TA_CENTER, TA_LEFT
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.lib.units import mm
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.platypus import (
+    CondPageBreak,
+    Image,
+    KeepTogether,
+    PageBreak,
+    Paragraph,
+    SimpleDocTemplate,
+    Spacer,
+    Table,
+    TableStyle,
+)
+from reportlab.lib.utils import ImageReader
+
+from app.database import ReviewDatabase
+from app.evidence import render_pdf_evidence_bytes
+
+
+NAVY = colors.HexColor("#132238")
+BLUE = colors.HexColor("#276EF1")
+INK = colors.HexColor("#202939")
+MUTED = colors.HexColor("#697386")
+PALE = colors.HexColor("#F4F7FB")
+LINE = colors.HexColor("#DDE3EC")
+WHITE = colors.white
+SEVERITY_COLORS = {
+    "Critical": colors.HexColor("#B42318"),
+    "Major": colors.HexColor("#D92D20"),
+    "Minor": colors.HexColor("#EAAA08"),
+    "Warning": colors.HexColor("#F79009"),
+    "Review": colors.HexColor("#667085"),
+}
+CJK_FONT = "STSong-Light"
+
+
+def export_batch_pdf(db: ReviewDatabase, batch_id: str) -> bytes:
+    batch = db.one(
+        """SELECT b.*,t.name template_name FROM review_batches b
+           LEFT JOIN audit_templates t ON t.id=b.template_id WHERE b.id=?""",
+        (batch_id,),
+    )
+    if not batch:
+        raise ValueError("审核批次不存在")
+    findings = db.query(
+        """SELECT * FROM findings WHERE batch_id=? ORDER BY
+           CASE severity WHEN 'Critical' THEN 1 WHEN 'Major' THEN 2 WHEN 'Minor' THEN 3
+           WHEN 'Warning' THEN 4 ELSE 5 END,id""",
+        (batch_id,),
+    )
+    documents = db.query(
+        """SELECT d.*,bd.role,bd.priority FROM batch_documents bd JOIN documents d ON d.id=bd.document_id
+           WHERE bd.batch_id=? ORDER BY bd.priority,d.created_at""",
+        (batch_id,),
+    )
+    return _build_report(batch, findings, documents)
+
+
+def _build_report(batch: dict[str, object], findings: list[dict[str, object]],
+                  documents: list[dict[str, object]]) -> bytes:
+    _register_fonts()
+    styles = _styles()
+    output = BytesIO()
+    document = SimpleDocTemplate(
+        output, pagesize=A4, rightMargin=18 * mm, leftMargin=18 * mm,
+        topMargin=22 * mm, bottomMargin=18 * mm,
+        title="供应商质量审核报告", author="供应商质量文件智能审查工具",
+    )
+    story: list[object] = []
+    supplier_docs = [item for item in documents if item["role"] == "supplier"]
+    basis_docs = [item for item in documents if item["role"] != "supplier"]
+    counts = {level: sum(item["severity"] == level for item in findings)
+              for level in ("Critical", "Major", "Minor", "Warning", "Review")}
+
+    story.extend(_cover(batch, findings, supplier_docs, basis_docs, counts, styles))
+    story.append(PageBreak())
+    story.extend(_detail_intro(findings, styles))
+    file_lookup = {str(item["original_name"]): item for item in supplier_docs}
+    for index, finding in enumerate(findings, start=1):
+        if index > 1:
+            story.append(PageBreak())
+        story.extend(_finding_detail(index, finding, file_lookup, styles))
+
+    if not findings:
+        story.append(Spacer(1, 18 * mm))
+        story.append(Paragraph("本批次未发现系统判定的问题或待确认项。", styles["empty"]))
+
+    document.build(story, onFirstPage=_first_page, onLaterPages=_later_pages)
+    return output.getvalue()
+
+
+def _cover(batch: dict[str, object], findings: list[dict[str, object]],
+           supplier_docs: list[dict[str, object]], basis_docs: list[dict[str, object]],
+           counts: dict[str, int], styles: dict[str, ParagraphStyle]) -> list[object]:
+    supplier = str(batch.get("supplier_name") or "未识别")
+    summary = _summary_text(counts, len(findings))
+    items: list[object] = [
+        Spacer(1, 12 * mm),
+        Paragraph("SUPPLIER QUALITY REVIEW", styles["eyebrow"]),
+        Spacer(1, 3 * mm),
+        Paragraph("供应商质量审核报告", styles["title"]),
+        Spacer(1, 4 * mm),
+        Paragraph(str(batch.get("name") or "审核批次"), styles["subtitle"]),
+        Spacer(1, 11 * mm),
+        Table(
+            [[Paragraph("供应商", styles["meta_label"]), Paragraph(_safe(supplier), styles["supplier"])],
+             [Paragraph("审核批次 ID", styles["meta_label"]), Paragraph(_safe(str(batch.get("id") or "-")), styles["meta_value"])],
+             [Paragraph("审核模板", styles["meta_label"]), Paragraph(_safe(str(batch.get("template_name") or "未指定")), styles["meta_value"])],
+             [Paragraph("生成时间", styles["meta_label"]), Paragraph(_safe(_display_time(str(batch.get("updated_at") or batch.get("created_at") or ""))), styles["meta_value"])],
+             [Paragraph("审核范围", styles["meta_label"]), Paragraph(f"供应商文件 {len(supplier_docs)} 份 / 审核依据 {len(basis_docs)} 份", styles["meta_value"])]],
+            colWidths=[34 * mm, 123 * mm],
+            style=TableStyle([
+                ("BACKGROUND", (0, 0), (-1, -1), PALE), ("BOX", (0, 0), (-1, -1), 0.7, LINE),
+                ("INNERGRID", (0, 0), (-1, -1), 0.35, LINE), ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 9), ("RIGHTPADDING", (0, 0), (-1, -1), 9),
+                ("TOPPADDING", (0, 0), (-1, -1), 7), ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+            ]),
+        ),
+        Spacer(1, 10 * mm),
+        Paragraph("审核摘要", styles["section"]),
+        Spacer(1, 3 * mm),
+        _severity_cards(counts, styles),
+        Spacer(1, 6 * mm),
+        Table([[Paragraph(_safe(summary), styles["summary"]) ]], colWidths=[157 * mm],
+              style=TableStyle([("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#EEF4FF")),
+                                ("BOX", (0, 0), (-1, -1), 0.8, colors.HexColor("#B8CCF4")),
+                                ("LEFTPADDING", (0, 0), (-1, -1), 11), ("RIGHTPADDING", (0, 0), (-1, -1), 11),
+                                ("TOPPADDING", (0, 0), (-1, -1), 9), ("BOTTOMPADDING", (0, 0), (-1, -1), 9)])),
+        Spacer(1, 9 * mm),
+        Paragraph("文件范围", styles["section"]),
+        Spacer(1, 3 * mm),
+        _document_table(supplier_docs, basis_docs, styles),
+    ]
+    return items
+
+
+def _severity_cards(counts: dict[str, int], styles: dict[str, ParagraphStyle]) -> Table:
+    labels = [("Critical", "严重"), ("Major", "主要"), ("Minor", "次要"), ("Warning", "警告"), ("Review", "待复核")]
+    cells = []
+    for level, label in labels:
+        cells.append(Paragraph(
+            f'<font color="#{SEVERITY_COLORS[level].hexval()[2:]}"><b>{counts[level]}</b></font><br/>'
+            f'<font color="#697386">{label}</font>', styles["card"]
+        ))
+    return Table([cells], colWidths=[31.4 * mm] * 5, rowHeights=[19 * mm],
+                 style=TableStyle([("BOX", (0, 0), (-1, -1), 0.6, LINE),
+                                   ("INNERGRID", (0, 0), (-1, -1), 0.5, LINE),
+                                   ("BACKGROUND", (0, 0), (-1, -1), WHITE),
+                                   ("VALIGN", (0, 0), (-1, -1), "MIDDLE")]))
+
+
+def _document_table(supplier_docs: list[dict[str, object]], basis_docs: list[dict[str, object]],
+                    styles: dict[str, ParagraphStyle]) -> Table:
+    rows = [[Paragraph("角色", styles["table_head"]), Paragraph("文件名称", styles["table_head"]),
+             Paragraph("页数", styles["table_head"]), Paragraph("处理状态", styles["table_head"])]]
+    for item in [*supplier_docs, *basis_docs]:
+        role = "供应商文件" if item["role"] == "supplier" else "审核依据"
+        rows.append([Paragraph(role, styles["table_cell"]), Paragraph(_safe(str(item["original_name"])), styles["table_cell"]),
+                     Paragraph(str(item["page_count"]), styles["table_cell"]),
+                     Paragraph(_safe(f"{item['parse_status']} / {item['ocr_status']}"), styles["table_cell"] )])
+    if len(rows) == 1:
+        rows.append([Paragraph("-", styles["table_cell"])] * 4)
+    return Table(rows, colWidths=[28 * mm, 78 * mm, 16 * mm, 35 * mm], repeatRows=1,
+                 style=TableStyle([("BACKGROUND", (0, 0), (-1, 0), NAVY),
+                                   ("BOX", (0, 0), (-1, -1), 0.6, LINE),
+                                   ("INNERGRID", (0, 0), (-1, -1), 0.35, LINE),
+                                   ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                                   ("LEFTPADDING", (0, 0), (-1, -1), 6),
+                                   ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+                                   ("TOPPADDING", (0, 0), (-1, -1), 5),
+                                   ("BOTTOMPADDING", (0, 0), (-1, -1), 5)]))
+
+
+def _detail_intro(findings: list[dict[str, object]], styles: dict[str, ParagraphStyle]) -> list[object]:
+    return [Paragraph("问题详情", styles["page_title"]), Spacer(1, 2 * mm),
+            Paragraph(f"以下共列出 {len(findings)} 项问题或待复核事项。截图仅在系统能够精确定位原文时显示。", styles["body"]),
+            Spacer(1, 7 * mm)]
+
+
+def _finding_detail(index: int, finding: dict[str, object], file_lookup: dict[str, dict[str, object]],
+                    styles: dict[str, ParagraphStyle]) -> list[object]:
+    severity = str(finding.get("severity") or "Review")
+    severity_color = SEVERITY_COLORS.get(severity, MUTED)
+    title = Table([[Paragraph(f"{index:02d}", styles["number"]),
+                    Paragraph(_safe(str(finding.get("item") or "审核问题")), styles["finding_title"]),
+                    Paragraph(_safe(severity), styles["severity"])]],
+                  colWidths=[14 * mm, 118 * mm, 25 * mm], rowHeights=[12 * mm],
+                  style=TableStyle([("BACKGROUND", (0, 0), (0, 0), NAVY),
+                                    ("BACKGROUND", (-1, 0), (-1, 0), severity_color),
+                                    ("BOX", (0, 0), (-1, -1), 0.7, LINE),
+                                    ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                                    ("LEFTPADDING", (0, 0), (-1, -1), 7),
+                                    ("RIGHTPADDING", (0, 0), (-1, -1), 7)]))
+    metadata = Table([
+        [Paragraph("类别", styles["meta_label"]), Paragraph(_safe(str(finding.get("category") or "-")), styles["meta_value"]),
+         Paragraph("人工状态", styles["meta_label"]), Paragraph(_safe(str(finding.get("status") or "-")), styles["meta_value"])],
+        [Paragraph("供应商文件", styles["meta_label"]), Paragraph(_safe(str(finding.get("source_file") or "-")), styles["meta_value"]),
+         Paragraph("原页", styles["meta_label"]), Paragraph(str(finding.get("source_page") or 1), styles["meta_value"])],
+        [Paragraph("审核依据", styles["meta_label"]), Paragraph(_safe(str(finding.get("standard_file") or "模板内置规则")), styles["meta_value"]),
+         Paragraph("条款", styles["meta_label"]), Paragraph(_safe(str(finding.get("standard_clause") or "-")), styles["meta_value"])],
+    ], colWidths=[24 * mm, 63 * mm, 24 * mm, 46 * mm],
+       style=TableStyle([("BACKGROUND", (0, 0), (-1, -1), PALE), ("BOX", (0, 0), (-1, -1), 0.6, LINE),
+                         ("INNERGRID", (0, 0), (-1, -1), 0.3, LINE), ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                         ("LEFTPADDING", (0, 0), (-1, -1), 6), ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+                         ("TOPPADDING", (0, 0), (-1, -1), 5), ("BOTTOMPADDING", (0, 0), (-1, -1), 5)]))
+    blocks: list[object] = [title, Spacer(1, 4 * mm), metadata, Spacer(1, 6 * mm)]
+    for label, key in (("问题说明", "description"), ("原报告证据", "source_text"), ("实际结果", "actual"),
+                       ("审核要求", "requirement"), ("判断逻辑", "logic"), ("整改建议", "suggestion")):
+        value = str(finding.get(key) or "-")
+        blocks.append(KeepTogether([Paragraph(label, styles["detail_label"]),
+                                    Paragraph(_safe(value[:4000]), styles["detail_value"]), Spacer(1, 3 * mm)]))
+
+    source = file_lookup.get(str(finding.get("source_file") or ""))
+    screenshot = _matched_screenshot(source, finding)
+    if screenshot:
+        blocks.extend([CondPageBreak(65 * mm), Spacer(1, 2 * mm), Paragraph("原报告问题位置", styles["detail_label"]),
+                       Spacer(1, 2 * mm), _report_image(screenshot),
+                       Paragraph("红框为系统在原报告中精确定位的证据。", styles["image_caption"])])
+    return blocks
+
+
+def _matched_screenshot(source: dict[str, object] | None, finding: dict[str, object]) -> bytes | None:
+    if not source:
+        return None
+    path = Path(str(source.get("stored_path") or ""))
+    if not path.is_file() or path.suffix.casefold() != ".pdf":
+        return None
+    try:
+        image, matched = render_pdf_evidence_bytes(
+            str(path), int(finding.get("source_page") or 1), str(finding.get("source_text") or ""),
+            str(finding.get("actual") or ""), str(finding.get("item") or ""),
+        )
+        return image if matched else None
+    except (OSError, ValueError, RuntimeError):
+        return None
+
+
+def _report_image(payload: bytes) -> Image:
+    reader = ImageReader(BytesIO(payload))
+    width, height = reader.getSize()
+    max_width, max_height = 157 * mm, 82 * mm
+    scale = min(max_width / width, max_height / height, 1.0)
+    return Image(BytesIO(payload), width=width * scale, height=height * scale, hAlign="CENTER")
+
+
+def _register_fonts() -> None:
+    global CJK_FONT
+    candidates = (
+        Path("C:/Windows/Fonts/simhei.ttf"),
+        Path("C:/Windows/Fonts/msyh.ttc"),
+        Path("/System/Library/Fonts/PingFang.ttc"),
+        Path("/System/Library/Fonts/Hiragino Sans GB.ttc"),
+        Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
+    )
+    for candidate in candidates:
+        if not candidate.is_file():
+            continue
+        try:
+            if "QaqcCJK" not in pdfmetrics.getRegisteredFontNames():
+                pdfmetrics.registerFont(TTFont("QaqcCJK", str(candidate), subfontIndex=0))
+            CJK_FONT = "QaqcCJK"
+            return
+        except (OSError, ValueError):
+            continue
+    if "STSong-Light" not in pdfmetrics.getRegisteredFontNames():
+        pdfmetrics.registerFont(UnicodeCIDFont("STSong-Light"))
+    CJK_FONT = "STSong-Light"
+
+
+def _styles() -> dict[str, ParagraphStyle]:
+    base = getSampleStyleSheet()
+    return {
+        "eyebrow": ParagraphStyle("eyebrow", parent=base["Normal"], fontName="Helvetica-Bold", fontSize=8,
+                                  leading=10, textColor=BLUE, tracking=1.5),
+        "title": ParagraphStyle("title", parent=base["Title"], fontName=CJK_FONT, fontSize=25,
+                                leading=31, textColor=NAVY, alignment=TA_LEFT),
+        "subtitle": ParagraphStyle("subtitle", parent=base["Normal"], fontName=CJK_FONT, fontSize=11,
+                                   leading=15, textColor=MUTED),
+        "section": ParagraphStyle("section", parent=base["Heading2"], fontName=CJK_FONT, fontSize=13,
+                                  leading=18, textColor=NAVY, spaceAfter=0),
+        "page_title": ParagraphStyle("page_title", parent=base["Heading1"], fontName=CJK_FONT, fontSize=20,
+                                     leading=26, textColor=NAVY),
+        "body": ParagraphStyle("body", parent=base["BodyText"], fontName=CJK_FONT, fontSize=9.2,
+                               leading=14, textColor=INK),
+        "meta_label": ParagraphStyle("meta_label", parent=base["Normal"], fontName=CJK_FONT, fontSize=8.3,
+                                     leading=12, textColor=MUTED),
+        "meta_value": ParagraphStyle("meta_value", parent=base["Normal"], fontName=CJK_FONT, fontSize=8.6,
+                                     leading=12, textColor=INK),
+        "supplier": ParagraphStyle("supplier", parent=base["Normal"], fontName=CJK_FONT, fontSize=10.5,
+                                   leading=15, textColor=NAVY),
+        "summary": ParagraphStyle("summary", parent=base["Normal"], fontName=CJK_FONT, fontSize=10,
+                                  leading=15, textColor=NAVY),
+        "card": ParagraphStyle("card", parent=base["Normal"], fontName=CJK_FONT, fontSize=8.5,
+                               leading=15, alignment=TA_CENTER),
+        "table_head": ParagraphStyle("table_head", parent=base["Normal"], fontName=CJK_FONT, fontSize=8,
+                                     leading=11, textColor=WHITE),
+        "table_cell": ParagraphStyle("table_cell", parent=base["Normal"], fontName=CJK_FONT, fontSize=7.8,
+                                     leading=11, textColor=INK),
+        "number": ParagraphStyle("number", parent=base["Normal"], fontName="Helvetica-Bold", fontSize=10,
+                                 leading=12, textColor=WHITE, alignment=TA_CENTER),
+        "finding_title": ParagraphStyle("finding_title", parent=base["Normal"], fontName=CJK_FONT, fontSize=12,
+                                        leading=15, textColor=NAVY),
+        "severity": ParagraphStyle("severity", parent=base["Normal"], fontName="Helvetica-Bold", fontSize=8,
+                                   leading=10, textColor=WHITE, alignment=TA_CENTER),
+        "detail_label": ParagraphStyle("detail_label", parent=base["Normal"], fontName=CJK_FONT, fontSize=8.3,
+                                       leading=11, textColor=BLUE),
+        "detail_value": ParagraphStyle("detail_value", parent=base["BodyText"], fontName=CJK_FONT, fontSize=9.2,
+                                       leading=14, textColor=INK, borderColor=LINE, borderWidth=0.5,
+                                       borderPadding=7, backColor=colors.HexColor("#FBFCFE")),
+        "image_caption": ParagraphStyle("image_caption", parent=base["Normal"], fontName=CJK_FONT, fontSize=7.5,
+                                        leading=10, textColor=MUTED, alignment=TA_CENTER, spaceBefore=3),
+        "empty": ParagraphStyle("empty", parent=base["Normal"], fontName=CJK_FONT, fontSize=12,
+                                leading=18, textColor=MUTED, alignment=TA_CENTER),
+    }
+
+
+def _first_page(canvas: object, document: object) -> None:
+    _footer(canvas)
+
+
+def _later_pages(canvas: object, document: object) -> None:
+    canvas.saveState()
+    canvas.setStrokeColor(LINE)
+    canvas.line(18 * mm, A4[1] - 14 * mm, A4[0] - 18 * mm, A4[1] - 14 * mm)
+    canvas.setFont(CJK_FONT, 7.5)
+    canvas.setFillColor(MUTED)
+    canvas.drawString(18 * mm, A4[1] - 11 * mm, "供应商质量审核报告 / 问题详情")
+    canvas.restoreState()
+    _footer(canvas)
+
+
+def _footer(canvas: object) -> None:
+    canvas.saveState()
+    canvas.setStrokeColor(LINE)
+    canvas.line(18 * mm, 12 * mm, A4[0] - 18 * mm, 12 * mm)
+    canvas.setFont(CJK_FONT, 7.2)
+    canvas.setFillColor(MUTED)
+    canvas.drawString(18 * mm, 8 * mm, "由供应商质量文件智能审查工具生成 / 结论须结合人工复核")
+    canvas.drawRightString(A4[0] - 18 * mm, 8 * mm, f"第 {canvas.getPageNumber()} 页")
+    canvas.restoreState()
+
+
+def _summary_text(counts: dict[str, int], total: int) -> str:
+    if counts["Critical"] or counts["Major"]:
+        return f"本批次共发现 {total} 项问题或待复核事项，其中严重/主要问题 {counts['Critical'] + counts['Major']} 项。建议完成整改、补证并人工复核后再关闭批次。"
+    if total:
+        return f"本批次共发现 {total} 项次要、警告或待复核事项，未发现严重/主要问题。建议结合原报告逐项确认。"
+    return "系统未发现问题或待复核事项。仍建议按企业质量流程完成必要的人工抽查。"
+
+
+def _display_time(value: str) -> str:
+    return value.replace("T", " ").replace("+00:00", " UTC") if value else "-"
+
+
+def _safe(value: str) -> str:
+    return html.escape(value).replace("\n", "<br/>")

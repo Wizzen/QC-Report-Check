@@ -56,32 +56,75 @@ class LLMClient:
         if not model:
             return {"ok": True, "detail": "LLM 服务连接正常（未指定模型，将使用服务端默认模型）"}
         try:
-            result = self.generate_json('只返回 JSON：{"ok":true}', retries=0)
-            return {"ok": bool(result.get("ok")), "detail": f"模型 {model} 返回有效 JSON"}
+            return self._probe_generation(model)
         except Exception as exc:
+            if "timed out" in str(exc).casefold():
+                return {"ok": False, "detail": f"服务可达且已发现模型 {model}，但最小对话 20 秒内未返回；模型可能仍在加载或推理队列繁忙"}
             return {"ok": False, "detail": str(exc)}
 
-    def generate_json(self, prompt: str, retries: int = 2) -> dict[str, Any]:
+    def _probe_generation(self, model: str) -> dict[str, Any]:
+        """Confirm that a model can generate without waiting for a full reasoning answer."""
+        response = requests.post(
+            f"{self.settings.llm_base_url}/chat/completions",
+            headers=_headers(self.settings.llm_api_key),
+            json={
+                "model": model, "temperature": 0, "stream": False, "max_tokens": 16,
+                "messages": [{"role": "user", "content": '只返回 JSON：{"ok":true}'}],
+            },
+            timeout=20,
+        )
+        response.raise_for_status()
+        body = response.json()
+        if isinstance(body.get("error"), dict):
+            return {"ok": False, "detail": f"LLM 服务错误：{body['error'].get('message') or '未知错误'}"}
+        choices = body.get("choices")
+        if not isinstance(choices, list) or not choices:
+            return {"ok": False, "detail": "LLM 响应缺少 choices 字段"}
+        message = choices[0].get("message", {})
+        content = str(message.get("content") or "").strip()
+        if content:
+            result = parse_json_object(content)
+            return {"ok": bool(result.get("ok")), "detail": f"模型 {model} 返回有效 JSON"}
+        reasoning = str(message.get("reasoning_content") or message.get("reasoning") or "").strip()
+        if reasoning:
+            return {"ok": True, "detail": f"模型 {model} 的思考模式响应正常（连接测试已收到推理 token，不等待最终答案）"}
+        return {"ok": False, "detail": f"模型 {model} 返回空响应"}
+
+    def generate_json(self, prompt: str, retries: int = 2, timeout_seconds: int = 180,
+                      max_tokens: int | None = None) -> dict[str, Any]:
         last_error: Exception | None = None
         for attempt in range(retries + 1):
             try:
                 payload: dict[str, Any] = {
                     "temperature": self.settings.llm_temperature,
+                    "stream": False,
                     "messages": [{"role": "user", "content": prompt + ("\n只输出一个 JSON 对象。" if attempt else "")}],
                 }
                 model = self.settings.llm_model.strip()
                 if model:
                     payload["model"] = model
+                if max_tokens is not None:
+                    payload["max_tokens"] = max_tokens
                 response = requests.post(
                     f"{self.settings.llm_base_url}/chat/completions",
                     headers=_headers(self.settings.llm_api_key),
                     json=payload,
-                    timeout=180,
+                    timeout=timeout_seconds,
                 )
                 response.raise_for_status()
                 body = response.json()
-                content = body["choices"][0]["message"]["content"]
+                if isinstance(body.get("error"), dict):
+                    raise ValueError(f"LLM 服务错误：{body['error'].get('message') or '未知错误'}")
+                choices = body.get("choices")
+                if not isinstance(choices, list) or not choices:
+                    fields = "、".join(sorted(str(key) for key in body))
+                    raise ValueError(f"LLM 响应缺少 choices 字段（实际字段：{fields or '无'}）")
+                message = choices[0].get("message", {})
+                content = message.get("content")
                 if content is None or not str(content).strip():
+                    reasoning = message.get("reasoning_content") or message.get("reasoning")
+                    if reasoning and str(reasoning).strip():
+                        raise ValueError("LLM 只返回推理内容，未返回最终 JSON")
                     raise ValueError("LLM 返回空内容")
                 return parse_json_object(str(content))
             except (requests.RequestException, KeyError, ValueError, json.JSONDecodeError) as exc:
@@ -129,16 +172,16 @@ class EmbeddingClient:
             return ping
         if not self.settings.embedding_model.strip():
             return {"ok": True, "detail": "Embedding 服务连接正常（未指定模型）"}
-        vector = self.embed(["供应商质量文件连接测试"])[0]
+        vector = self.embed(["供应商质量文件连接测试"], timeout_seconds=20)[0]
         return {"ok": bool(vector), "detail": f"真实向量生成成功，维度 {len(vector)}"}
 
-    def embed(self, texts: list[str]) -> list[list[float]]:
+    def embed(self, texts: list[str], timeout_seconds: int = 180) -> list[list[float]]:
         if not self.settings.embedding_model:
             raise ValueError("Embedding 模型名称为空")
         response = requests.post(
             f"{self.settings.embedding_base_url}/embeddings",
             headers=_headers(self.settings.embedding_api_key),
-            json={"model": self.settings.embedding_model, "input": texts}, timeout=180,
+            json={"model": self.settings.embedding_model, "input": texts}, timeout=timeout_seconds,
         )
         response.raise_for_status()
         data = sorted(response.json().get("data", []), key=lambda item: item.get("index", 0))

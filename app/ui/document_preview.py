@@ -6,6 +6,8 @@ from pathlib import Path
 import pymupdf
 import streamlit as st
 
+from app.evidence import render_pdf_evidence_bytes
+
 
 def document_pages(page_text: str, raw_text: str) -> list[dict[str, object]]:
     try:
@@ -34,3 +36,12 @@ def render_pdf_page(path_text: str, modified_ns: int, page_number: int) -> bytes
         page_index = max(0, min(page_number - 1, document.page_count - 1))
         pixmap = document.load_page(page_index).get_pixmap(matrix=pymupdf.Matrix(1.35, 1.35), alpha=False)
         return pixmap.tobytes("png")
+
+
+@st.cache_data(max_entries=24, show_spinner=False)
+def render_pdf_evidence(
+    path_text: str, modified_ns: int, page_number: int, source_text: str, actual: str, item: str
+) -> tuple[bytes, bool]:
+    """Render a focused PDF screenshot and outline the matched evidence when possible."""
+    del modified_ns
+    return render_pdf_evidence_bytes(path_text, page_number, source_text, actual, item)

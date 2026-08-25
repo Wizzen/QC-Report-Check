@@ -12,7 +12,7 @@ if not exist ".venv\Scripts\python.exe" (
   python -m venv .venv
   if errorlevel 1 goto :failed
 )
-".venv\Scripts\python.exe" -c "import streamlit,chromadb,cryptography,pandas,pymupdf,docx,openpyxl" >nul 2>nul
+".venv\Scripts\python.exe" -c "import streamlit,chromadb,cryptography,pandas,pymupdf,docx,openpyxl,reportlab" >nul 2>nul
 if errorlevel 1 (
   echo Installing or updating local dependencies...
   ".venv\Scripts\python.exe" -m pip install -r requirements.txt

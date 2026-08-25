@@ -108,4 +108,42 @@ def test_llm_json_request_uses_broad_openai_compatible_payload(tmp_path: Path) -
     assert result == {"ok": True}
     payload = request.call_args.kwargs["json"]
     assert payload["model"] == "qwen-test"
+    assert payload["stream"] is False
     assert "response_format" not in payload
+
+
+def test_llm_connection_test_has_short_bounded_probe(tmp_path: Path) -> None:
+    settings = _store(tmp_path).save({"llm_model": "slow-model"})
+    client = LLMClient(settings)
+
+    with patch.object(client, "ping", return_value={"ok": True, "detail": "连接成功"}), \
+         patch("app.integrations.clients.requests.post", side_effect=RuntimeError("Read timed out")) as request:
+        result = client.test()
+
+    assert result["ok"] is False
+    assert "20 秒" in result["detail"]
+    assert "模型可能仍在加载" in result["detail"]
+    assert request.call_args.kwargs["timeout"] == 20
+    assert request.call_args.kwargs["json"]["max_tokens"] == 16
+
+
+def test_llm_reports_reasoning_only_response_clearly(tmp_path: Path) -> None:
+    settings = _store(tmp_path).save({"llm_model": "thinking-model"})
+    client = LLMClient(settings)
+    response = Mock()
+    response.status_code = 200
+    response.raise_for_status.return_value = None
+    response.json.return_value = {
+        "choices": [{"message": {"content": "", "reasoning_content": "internal reasoning"}}]
+    }
+
+    with patch.object(client, "ping", return_value={"ok": True, "detail": "连接成功"}), \
+         patch("app.integrations.clients.requests.post", return_value=response):
+        result = client.test()
+
+    assert result["ok"] is True
+    assert "思考模式响应正常" in result["detail"]
+
+    with patch("app.integrations.clients.requests.post", return_value=response):
+        with pytest.raises(RuntimeError, match="只返回推理内容"):
+            client.generate_json("test", retries=0, max_tokens=16)

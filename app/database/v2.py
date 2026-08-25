@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS audit_templates (
 );
 CREATE TABLE IF NOT EXISTS review_batches (
   id TEXT PRIMARY KEY, name TEXT NOT NULL, template_id INTEGER,
+  supplier_name TEXT NOT NULL DEFAULT '',
   status TEXT NOT NULL DEFAULT 'queued', stage TEXT NOT NULL DEFAULT '等待处理',
   progress INTEGER NOT NULL DEFAULT 0, current_file TEXT NOT NULL DEFAULT '',
   activity TEXT NOT NULL DEFAULT '任务已进入本地队列', resource TEXT NOT NULL DEFAULT 'SQLite 本地任务队列',
@@ -34,6 +35,7 @@ CREATE TABLE IF NOT EXISTS review_batches (
 CREATE TABLE IF NOT EXISTS documents (
   id TEXT PRIMARY KEY, library_code TEXT NOT NULL,
   document_kind TEXT NOT NULL DEFAULT 'other', original_name TEXT NOT NULL,
+  supplier_name TEXT NOT NULL DEFAULT '',
   stored_path TEXT NOT NULL, sha256 TEXT NOT NULL, mime_type TEXT NOT NULL DEFAULT '',
   page_count INTEGER NOT NULL DEFAULT 0, page_text TEXT NOT NULL DEFAULT '[]',
   raw_text TEXT NOT NULL DEFAULT '', markdown TEXT NOT NULL DEFAULT '', html TEXT NOT NULL DEFAULT '',
@@ -141,12 +143,16 @@ class ReviewDatabase:
             connection.executescript(SCHEMA_V2)
             columns = {row[1] for row in connection.execute("PRAGMA table_info(review_batches)").fetchall()}
             for name, declaration in {
+                "supplier_name": "TEXT NOT NULL DEFAULT ''",
                 "activity": "TEXT NOT NULL DEFAULT '任务已进入本地队列'",
                 "resource": "TEXT NOT NULL DEFAULT 'SQLite 本地任务队列'",
                 "heartbeat_at": "TEXT NOT NULL DEFAULT ''",
             }.items():
                 if name not in columns:
                     connection.execute(f"ALTER TABLE review_batches ADD COLUMN {name} {declaration}")
+            document_columns = {row[1] for row in connection.execute("PRAGMA table_info(documents)").fetchall()}
+            if "supplier_name" not in document_columns:
+                connection.execute("ALTER TABLE documents ADD COLUMN supplier_name TEXT NOT NULL DEFAULT ''")
             template_columns = {row[1] for row in connection.execute("PRAGMA table_info(audit_templates)").fetchall()}
             if "review_instructions" not in template_columns:
                 connection.execute("ALTER TABLE audit_templates ADD COLUMN review_instructions TEXT NOT NULL DEFAULT ''")

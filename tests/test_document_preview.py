@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pymupdf
 
-from app.ui.document_preview import document_pages, read_original_file, render_pdf_page
+from app.ui.document_preview import document_pages, read_original_file, render_pdf_evidence, render_pdf_page
 
 
 def test_document_pages_uses_page_aware_text_and_fallback() -> None:
@@ -24,6 +24,11 @@ def test_original_download_and_pdf_render(tmp_path: Path) -> None:
     modified = pdf_path.stat().st_mtime_ns
     assert read_original_file(str(pdf_path), modified).startswith(b"%PDF")
     assert render_pdf_page(str(pdf_path), modified, 1).startswith(b"\x89PNG")
+    screenshot, matched = render_pdf_evidence(
+        str(pdf_path), modified, 1, "Supplier report", "", "Supplier"
+    )
+    assert screenshot.startswith(b"\x89PNG")
+    assert matched is True
 
 
 def test_macos_launcher_is_self_contained() -> None:

@@ -2,17 +2,19 @@ from __future__ import annotations
 
 import html
 import json
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 
-from app.exporters import export_batch
+from app.exporters import export_batch, export_batch_pdf
 from app.integrations import EmbeddingClient, LLMClient, MinerUClient
 from app.integrations.settings import mask_secret
 from app.ui.context import get_context
-from app.ui.document_preview import document_pages, read_original_file, render_pdf_page
+from app.ui.document_preview import document_pages, read_original_file, render_pdf_evidence, render_pdf_page
 
 
 def start_review_page() -> None:
@@ -27,12 +29,17 @@ def start_review_page() -> None:
     chosen_name = st.selectbox("审核模板", list(template_options), key="review_template")
     template_id = template_options.get(chosen_name)
     basis = ctx.db.query("SELECT id,original_name,document_kind FROM documents WHERE library_code='basis' AND parse_status='completed' ORDER BY created_at DESC")
-    basis_options = {f"{row['original_name']} · {_kind_label(row['document_kind'])}": row["id"] for row in basis}
+    built_in_label = f"{chosen_name} · 内置模板规则（自动启用）"
+    basis_options = {built_in_label: None, **{
+        f"{row['original_name']} · {_kind_label(row['document_kind'])}": row["id"] for row in basis
+    }}
     defaults = [row["document_id"] for row in ctx.db.query("SELECT document_id FROM template_basis WHERE template_id=?", (template_id,))]
-    default_labels = [label for label, doc_id in basis_options.items() if doc_id in defaults]
+    default_labels = [built_in_label, *[label for label, doc_id in basis_options.items() if doc_id in defaults]]
     selected_labels = st.multiselect("审核依据", list(basis_options), default=default_labels,
                                      placeholder="可多选；模板绑定的依据会自动带出")
-    selected_ids = [basis_options[label] for label in selected_labels]
+    selected_ids = [basis_options[label] for label in selected_labels if basis_options[label]]
+    if not basis:
+        st.caption("当前使用审核模板内置规则；审核依据库暂无额外标准，可稍后导入采购要求、图纸或标准。")
     left, right = st.columns(2, gap="large")
     with left:
         st.html('<div class="qaqc-file-label">供应商质量文件　<span style="color:#b42318">必填</span></div>')
@@ -73,6 +80,7 @@ def batch_status_card(batch_id: str) -> None:
         with top:
             st.subheader(batch["name"])
             st.badge(_status_label(batch["status"]), color=_status_color(batch["status"]))
+        st.caption(f"供应商：{batch.get('supplier_name') or ('正在根据 OCR/LLM 识别' if batch['status'] in {'queued', 'running'} else '未识别')}")
         st.progress(int(batch["progress"]), text=f"{batch['stage']} {('· ' + batch['current_file']) if batch['current_file'] else ''}")
         age = _heartbeat_age(batch.get("heartbeat_at") or batch.get("updated_at"))
         activity = batch.get("activity") or "等待 worker 更新当前操作"
@@ -100,7 +108,7 @@ def review_records_page() -> None:
     if not batches:
         st.info("暂无审核记录。请先在“开始审核”上传文件。")
         return
-    options = {f"{row['name']} · {_status_label(row['status'])}": row["id"] for row in batches}
+    options = {f"{row['name']} · {row.get('supplier_name') or '供应商识别中/未识别'} · {_status_label(row['status'])}": row["id"] for row in batches}
     preferred = st.session_state.get("record_batch")
     index = next((i for i, value in enumerate(options.values()) if value == preferred), 0)
     label = st.selectbox("选择审核批次", list(options), index=index)
@@ -150,10 +158,44 @@ def _render_findings(batch_id: str) -> None:
                                         ("已整改", "已整改", ":material/build:"), ("关闭", "已关闭", ":material/done_all:")]:
                 if st.button(label, icon=icon, key=f"finding_{selected['id']}_{status}"):
                     ctx.db.update_finding_status(selected["id"], status); st.rerun()
-    data = export_batch(ctx.db, batch_id)
-    st.download_button("导出问题清单.xlsx", data, "供应商质量文件问题清单.xlsx",
-                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                       icon=":material/download:")
+    evidence_document = ctx.db.one(
+        """SELECT d.stored_path,d.original_name FROM batch_documents bd JOIN documents d ON d.id=bd.document_id
+           WHERE bd.batch_id=? AND bd.role='supplier' AND d.original_name=? ORDER BY d.created_at LIMIT 1""",
+        (batch_id, selected["source_file"]),
+    )
+    with st.container(border=True):
+        st.markdown("**原报告问题位置**")
+        if not evidence_document:
+            st.info("未找到与该问题关联的原报告文件。")
+        else:
+            evidence_path = Path(str(evidence_document["stored_path"]))
+            if not evidence_path.is_file():
+                st.info("原报告文件已移动或不存在，暂时无法生成截图。")
+            elif evidence_path.suffix.casefold() == ".pdf":
+                screenshot, matched = render_pdf_evidence(
+                    str(evidence_path), evidence_path.stat().st_mtime_ns, int(selected["source_page"] or 1),
+                    str(selected["source_text"] or ""), str(selected["actual"] or ""), str(selected["item"] or ""),
+                )
+                st.image(screenshot, caption=("红框为系统定位的原文证据" if matched else "未精确匹配文字，显示对应原页供人工查看"), width="stretch")
+            elif evidence_path.suffix.casefold() in {".jpg", ".jpeg", ".png"}:
+                st.image(str(evidence_path), caption="原始报告图片", width="stretch")
+            else:
+                st.info("该文件不是 PDF/图片，请使用供应商档案中的下载按钮查看原始排版。")
+    excel_data = export_batch(ctx.db, batch_id)
+    export_signature = json.dumps([(row["id"], row["status"]) for row in findings], ensure_ascii=False)
+    pdf_data = _cached_pdf_export(batch_id, export_signature, _db=ctx.db)
+    with st.container(horizontal=True):
+        st.download_button("导出问题清单.xlsx", excel_data, "供应商质量文件问题清单.xlsx",
+                           "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                           icon=":material/table_view:")
+        st.download_button("导出精美审核报告.pdf", pdf_data, f"供应商质量审核报告-{batch_id[:8]}.pdf",
+                           "application/pdf", icon=":material/picture_as_pdf:")
+
+
+@st.cache_data(max_entries=12, show_spinner="正在生成带原页证据的审核报告…")
+def _cached_pdf_export(batch_id: str, export_signature: str, *, _db: object) -> bytes:
+    del export_signature
+    return export_batch_pdf(_db, batch_id)  # type: ignore[arg-type]
 
 
 def basis_library_page() -> None:
@@ -185,20 +227,39 @@ def basis_library_page() -> None:
 def supplier_library_page() -> None:
     ctx = get_context()
     _section_header("供应商档案", "供应商文件按自动审核批次永久保留，仅作为被审证据，不会被当作标准依据。")
-    rows = ctx.db.query("""SELECT d.id,d.original_name,d.stored_path,d.mime_type,d.sha256,d.page_count,d.page_text,d.raw_text,
+    rows = ctx.db.query("""SELECT d.id,d.original_name,d.supplier_name,d.stored_path,d.mime_type,d.sha256,d.page_count,d.page_text,d.raw_text,
         d.document_kind,d.parse_status,d.ocr_status,d.index_status,d.error,d.created_at,
         GROUP_CONCAT(DISTINCT b.name) batches FROM documents d LEFT JOIN batch_documents bd ON bd.document_id=d.id
         LEFT JOIN review_batches b ON b.id=bd.batch_id WHERE d.library_code='supplier' GROUP BY d.id ORDER BY d.created_at DESC""")
     if rows:
-        table = pd.DataFrame(rows)[["original_name", "document_kind", "page_count", "parse_status", "ocr_status",
-                                    "index_status", "created_at", "batches"]]
-        st.dataframe(table, width="stretch", hide_index=True,
-                     column_config={"original_name": "文件名称", "document_kind": "类型", "page_count": "页数",
-                                    "parse_status": "解析", "ocr_status": "OCR", "index_status": "索引",
-                                    "created_at": "上传时间", "batches": "审核批次"})
+        document_ids = [str(row["id"]) for row in rows]
+        selected_id = str(st.session_state.get("supplier_document_preview_id") or document_ids[0])
+        if selected_id not in document_ids:
+            selected_id = document_ids[0]
+            st.session_state["supplier_document_preview_id"] = selected_id
+        table = pd.DataFrame(rows).set_index("id")[["supplier_name", "original_name", "document_kind", "page_count",
+            "parse_status", "ocr_status", "index_status", "created_at", "batches"]]
+        table.insert(0, "selected", [str(index) == selected_id for index in table.index])
+        edited = st.data_editor(
+            table, width="stretch", hide_index=True, key="supplier_archive_table",
+            disabled=[column for column in table.columns if column != "selected"],
+            column_config={"selected": st.column_config.CheckboxColumn("查看", help="勾选后，下方立即显示该报告"),
+                           "supplier_name": "供应商名称", "original_name": "文件名称", "document_kind": "类型",
+                           "page_count": "页数", "parse_status": "解析", "ocr_status": "OCR",
+                           "index_status": "索引", "created_at": "上传时间", "batches": "审核批次"},
+        )
+        checked = [str(index) for index in edited.index[edited["selected"]]]
+        newly_checked = next((value for value in checked if value != selected_id), None)
+        if newly_checked:
+            st.session_state["supplier_document_preview_id"] = newly_checked
+            st.rerun()
         st.subheader("浏览报告内容")
-        options = {f"{row['original_name']} · {row['created_at']} · {row['id'][:8]}": row for row in rows}
-        selected = options[st.selectbox("选择报告", list(options), key="supplier_document_preview")]
+        row_lookup = {str(row["id"]): row for row in rows}
+        selected_id = st.selectbox(
+            "选择报告", document_ids, key="supplier_document_preview_id",
+            format_func=lambda value: f"{row_lookup[value].get('supplier_name') or '供应商未识别'} · {row_lookup[value]['original_name']} · {row_lookup[value]['created_at']}",
+        )
+        selected = row_lookup[str(selected_id)]
         _supplier_document_detail(selected)
     else:
         st.info("暂无供应商档案。")
@@ -217,6 +278,7 @@ def _supplier_document_detail(document: dict[str, object]) -> None:
         with heading:
             st.markdown(f"**{document['original_name']}**")
             st.badge(f"{document['page_count']} 页", color="gray")
+        st.caption(f"供应商：{document.get('supplier_name') or '未识别（重新审核时将结合 OCR 与 LLM 复核）'}")
         view = st.segmented_control(
             "浏览方式", ["提取内容", "原文件预览", "处理信息"], default="提取内容",
             key=f"preview_mode_{document['id']}",
@@ -353,6 +415,7 @@ def settings_page() -> None:
         if st.button("测试 OCR", icon=":material/document_scanner:"):
             _show_test(lambda: MinerUClient(ctx.config_store.get()).test())
     st.caption("API Key 加密保存在 data/secrets，页面和日志不会显示明文。")
+    st.caption("提示：思考型模型的连接测试只确认已经产生推理响应；正式审核会继续等待思考完成并读取最终 JSON。")
     with st.expander("保存当前连接为预设"):
         preset_category = st.segmented_control(
             "服务类型", ["LLM", "Embedding", "OCR"], default="LLM", key="preset_category"
@@ -386,20 +449,27 @@ def _test_all_services(settings) -> None:
         ("OCR", lambda: MinerUClient(settings).test()),
     ]
     passed = 0
-    with st.status("正在依次测试 LLM、Embedding 和 OCR…", expanded=True) as status:
-        for name, callback in checks:
-            st.write(f"正在测试 **{name}**…")
-            try:
-                result = callback()
-                if result.get("ok"):
-                    passed += 1
-                    st.success(f"{name}：{result['detail']}")
-                else:
-                    st.warning(f"{name}：{result.get('detail') or '测试未通过'}")
-            except Exception as exc:
-                st.error(f"{name}：连接失败 — {exc}")
+    with st.status("正在并行测试 LLM、Embedding 和 OCR…", expanded=True) as status:
+        st.caption("三项测试同时开始；已完成的服务会立即显示，不再等待前一项结束。")
+        started = time.perf_counter()
+        with ThreadPoolExecutor(max_workers=len(checks), thread_name_prefix="service-test") as executor:
+            futures = {executor.submit(callback): (name, time.perf_counter()) for name, callback in checks}
+            for future in as_completed(futures):
+                name, item_started = futures[future]
+                elapsed = time.perf_counter() - item_started
+                try:
+                    result = future.result()
+                    if result.get("ok"):
+                        passed += 1
+                        st.success(f"{name}（{elapsed:.1f} 秒）：{result['detail']}")
+                    else:
+                        st.warning(f"{name}（{elapsed:.1f} 秒）：{result.get('detail') or '测试未通过'}")
+                except Exception as exc:
+                    st.error(f"{name}（{elapsed:.1f} 秒）：连接失败 — {exc}")
+        total = time.perf_counter() - started
         final_state = "complete" if passed == len(checks) else "error"
-        status.update(label=f"服务测试完成：{passed}/{len(checks)} 项通过", state=final_state, expanded=True)
+        status.update(label=f"服务测试完成：{passed}/{len(checks)} 项通过 · 总耗时 {total:.1f} 秒",
+                      state=final_state, expanded=True)
 
 
 def _section_header(title: str, subtitle: str) -> None:

@@ -18,7 +18,9 @@ from app.auditing.expert_review import (
     ExpertDocument,
     build_expert_prompt,
     deterministic_fastener_audit,
+    extract_supplier_names,
     findings_from_llm,
+    supplier_names_from_llm,
 )
 from app.database import ReviewDatabase
 from app.database.v2 import utcnow
@@ -42,6 +44,7 @@ class ReviewService:
         self.uploads, self.standards, self.vector_root = uploads, standards, vector_root
         self.max_bytes = max_upload_mb * 1024 * 1024
         self._ensure_fastener_template()
+        self._backfill_supplier_names()
 
     def _ensure_fastener_template(self) -> None:
         row = self.db.one("SELECT id FROM audit_templates WHERE name=?", (FASTENER_TEMPLATE_NAME,))
@@ -59,6 +62,17 @@ class ReviewService:
              json.dumps(["COC", "COI/MTR"], ensure_ascii=False),
              json.dumps(FASTENER_REQUIRED_CHECKS, ensure_ascii=False), FASTENER_REVIEW_INSTRUCTIONS, utcnow()),
         )
+
+    def _backfill_supplier_names(self) -> None:
+        rows = self.db.query(
+            """SELECT id,original_name,stored_path,page_text,ocr_status FROM documents
+               WHERE library_code='supplier' AND parse_status='completed'
+                 AND (supplier_name='' OR supplier_name LIKE '%�%')"""
+        )
+        for row in rows:
+            supplier_name = _join_names(extract_supplier_names(_expert_document(row)))
+            self.db.execute("UPDATE documents SET supplier_name=? WHERE id=?", (supplier_name, row["id"]))
+            self._refresh_supplier_names_for_document(row["id"])
 
     def create_review(self, template_id: int | None, selected_basis: list[str],
                       supplier_files: Iterable[object], supplemental_files: Iterable[object]) -> str:
@@ -185,6 +199,7 @@ class ReviewService:
         elif sparse_pages:
             ocr_status = "pending"
         raw_text = "\n\n".join(page.text for page in pages)
+        supplier_name = " / ".join(extract_supplier_names(pages)) if row["library_code"] == "supplier" else ""
         self._activity(batch_id, activity=f"正在从 {row['original_name']} 提取结构化字段和审核条款",
                        resource="本机 CPU · 正则提取器")
         with self.db.connect() as connection:
@@ -211,12 +226,13 @@ class ReviewService:
                        resource=_resource("Embedding", settings.embedding_base_url, settings.embedding_model))
         count, index_status = DocumentVectorIndex(self.vector_root, settings).index(document_id, pages)
         self.db.execute(
-            """UPDATE documents SET page_count=?,page_text=?,raw_text=?,markdown=?,parse_status='completed',
+            """UPDATE documents SET page_count=?,page_text=?,raw_text=?,markdown=?,supplier_name=?,parse_status='completed',
                ocr_status=?,index_status=?,index_fingerprint=?,index_collection=?,error='' WHERE id=?""",
             (len(pages), json.dumps([{"page": p.page, "text": p.text} for p in pages], ensure_ascii=False),
-             raw_text, raw_text, ocr_status, index_status, settings.embedding_fingerprint,
+             raw_text, raw_text, supplier_name, ocr_status, index_status, settings.embedding_fingerprint,
              f"{document_id}/document_chunks" if count else "", document_id),
         )
+        self._refresh_supplier_names_for_document(document_id)
         self._activity(batch_id, activity=f"{row['original_name']} 已完成解析、提取和索引",
                        resource=f"ChromaDB · {index_status}")
 
@@ -262,7 +278,7 @@ class ReviewService:
             self._activity(batch_id, activity="未配置 LLM Base URL，保留确定性专家规则结果", resource="本机规则引擎")
             return findings
         rows = self.db.query(
-            """SELECT d.original_name,d.stored_path,d.page_text,d.ocr_status FROM batch_documents bd
+            """SELECT d.id,d.original_name,d.stored_path,d.page_text,d.ocr_status FROM batch_documents bd
                JOIN documents d ON d.id=bd.document_id WHERE bd.batch_id=? AND bd.role='supplier'""", (batch_id,)
         )
         documents = [_expert_document(row) for row in rows]
@@ -281,6 +297,13 @@ class ReviewService:
         try:
             payload = LLMClient(settings).generate_json(build_expert_prompt(documents, instructions, findings, basis))
             discovered = findings_from_llm(payload, documents)
+            llm_names = supplier_names_from_llm(payload, documents)
+            for row in rows:
+                names = [*extract_supplier_names(_expert_document(row)), *llm_names.get(row["original_name"], [])]
+                combined = _join_names(names)
+                if combined:
+                    self.db.execute("UPDATE documents SET supplier_name=? WHERE id=?", (combined, row["id"]))
+                    self._refresh_supplier_names_for_document(row["id"])
             self._activity(batch_id, progress=94, activity=f"LLM 专家复核新增 {len(discovered)} 个有原页证据的问题",
                            resource=_resource("LLM", settings.llm_base_url, settings.llm_model))
             return _dedupe_findings([*findings, *discovered])
@@ -289,6 +312,20 @@ class ReviewService:
             self._activity(batch_id, progress=94, activity="LLM 专家复核未完成，已保留确定性规则结果",
                            resource=_resource("LLM", settings.llm_base_url, settings.llm_model))
             return findings
+
+    def _refresh_supplier_names_for_document(self, document_id: str) -> None:
+        batch_rows = self.db.query("SELECT batch_id FROM batch_documents WHERE document_id=? AND role='supplier'", (document_id,))
+        for batch_row in batch_rows:
+            rows = self.db.query(
+                """SELECT d.supplier_name FROM batch_documents bd JOIN documents d ON d.id=bd.document_id
+                   WHERE bd.batch_id=? AND bd.role='supplier' ORDER BY d.created_at,d.id""",
+                (batch_row["batch_id"],),
+            )
+            supplier_name = _join_names(
+                part.strip() for row in rows for part in str(row.get("supplier_name") or "").split("/") if part.strip()
+            )
+            self.db.execute("UPDATE review_batches SET supplier_name=?,updated_at=? WHERE id=?",
+                            (supplier_name, utcnow(), batch_row["batch_id"]))
 
     def _explain(self, batch_id: str, findings: list[Finding]) -> list[Finding]:
         settings = self.config_store.get()
@@ -345,6 +382,18 @@ def _optional_float(value: object) -> float | None:
         return None
     try: return float(value)
     except (TypeError, ValueError): return None
+
+
+def _join_names(names: Iterable[str]) -> str:
+    output: list[str] = []
+    seen: set[str] = set()
+    for value in names:
+        name = re.sub(r"\s+", " ", str(value)).strip(" \t:：,;，；-|_")
+        key = re.sub(r"[^0-9a-z\u3400-\u9fff]+", "", name.casefold())
+        if len(key) >= 5 and key not in seen:
+            seen.add(key)
+            output.append(name)
+    return " / ".join(output)
 
 
 def _resource(kind: str, base_url: str, model: str) -> str:

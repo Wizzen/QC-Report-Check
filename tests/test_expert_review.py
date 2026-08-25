@@ -3,7 +3,9 @@ from pathlib import Path
 from app.auditing.expert_review import (
     ExpertDocument,
     deterministic_fastener_audit,
+    extract_supplier_names,
     findings_from_llm,
+    supplier_names_from_llm,
 )
 from app.extractors import extract_filename_items
 from app.models import PageText
@@ -48,3 +50,29 @@ def test_wdc_is_recovered_from_filename() -> None:
     items = extract_filename_items("Q0045 5305-859240(MTR).pdf")
 
     assert [(item.key, item.value) for item in items] == [("wdc_number", "5305859240")]
+
+
+def test_supplier_names_are_extracted_and_buyer_is_excluded() -> None:
+    document = ExpertDocument("MTR.pdf", Path("sample.pdf"), [PageText(1, """
+Customer: CUSTOMER COMPANY
+Manufacturer: NINGBO JINDING FASTENING PIECE CO.,LTD
+Mill: HENAN JIYUAN IRON&STEEL CO.,LTD
+""")])
+
+    assert extract_supplier_names(document) == [
+        "NINGBO JINDING FASTENING PIECE CO.,LTD",
+        "HENAN JIYUAN IRON&STEEL CO.,LTD",
+    ]
+
+
+def test_llm_supplier_names_must_exist_in_source() -> None:
+    document = ExpertDocument("MTR.pdf", Path("sample.pdf"), [
+        PageText(1, "Manufacturer: NINGBO JINDING FASTENING PIECE CO.,LTD")
+    ])
+    payload = {"documents": [{"source_file": "MTR.pdf", "supplier_names": [
+        "NINGBO JINDING FASTENING PIECE CO.,LTD", "HALLUCINATED COMPANY LIMITED"
+    ]}]}
+
+    assert supplier_names_from_llm(payload, [document]) == {
+        "MTR.pdf": ["NINGBO JINDING FASTENING PIECE CO.,LTD"]
+    }
