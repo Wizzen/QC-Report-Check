@@ -168,10 +168,9 @@ def normalize_openai_url(value: str, *, ollama: bool = False) -> str:
         return ""
     parts = urlsplit(normalized)
     path = parts.path.rstrip("/")
-    # All adapters using this helper speak the OpenAI-compatible API. Local
-    # servers such as Ollama and LM Studio commonly expose it under /v1 even
-    # when users enter only host:port.
-    if path in {"", "/"}:
+    # Only Ollama's native 11434 endpoint is known to require /v1. Other
+    # OpenAI-compatible services may expose /embeddings directly at root.
+    if path in {"", "/"} and parts.port == 11434:
         path = "/v1"
     return urlunsplit((parts.scheme, parts.netloc, path, "", ""))
 
@@ -180,7 +179,7 @@ def is_remote_url(value: str) -> bool:
     if not value:
         return False
     host = (urlsplit(normalize_url(value)).hostname or "").casefold()
-    if host in {"localhost", "host.docker.internal"}:
+    if host in {"localhost", "host.docker.internal", "docker.for.mac.localhost"} or host.endswith((".local", ".lan")):
         return False
     try:
         address = ipaddress.ip_address(host)

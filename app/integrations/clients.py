@@ -11,7 +11,7 @@ from typing import Any
 
 import requests
 
-from app.integrations.settings import ServiceSettings, ensure_url_allowed
+from app.integrations.settings import ServiceSettings, ensure_url_allowed, is_remote_url
 from app.llm.ollama_client import parse_json_object
 
 
@@ -25,6 +25,18 @@ def _headers(api_key: str) -> dict[str, str]:
     return headers
 
 
+def _network_options(url: str) -> dict[str, object]:
+    """Keep macOS system proxies from intercepting loopback/LAN AI services."""
+    if not is_remote_url(url):
+        return {"proxies": {"http": "", "https": ""}}
+    return {}
+
+
+def _request_error(endpoint: str, exc: Exception) -> str:
+    message = str(exc).strip().replace("\n", " ")
+    return f"请求 {endpoint} 失败：{message[:240] or type(exc).__name__}"
+
+
 class LLMClient:
     def __init__(self, settings: ServiceSettings):
         self.settings = settings
@@ -36,6 +48,7 @@ class LLMClient:
                 f"{self.settings.llm_base_url}/models",
                 headers=_headers(self.settings.llm_api_key),
                 timeout=10,
+                **_network_options(self.settings.llm_base_url),
             )
             if response.status_code == 200:
                 return {"ok": True, "detail": "连接成功"}
@@ -46,7 +59,7 @@ class LLMClient:
             response.raise_for_status()
             return {"ok": False, "detail": f"HTTP {response.status_code}"}
         except requests.RequestException as exc:
-            return {"ok": False, "detail": f"连接失败：{type(exc).__name__}"}
+            return {"ok": False, "detail": _request_error(f"{self.settings.llm_base_url}/models", exc)}
 
     def test(self) -> dict[str, Any]:
         ping = self.ping()
@@ -72,6 +85,7 @@ class LLMClient:
                 "messages": [{"role": "user", "content": '只返回 JSON：{"ok":true}'}],
             },
             timeout=20,
+            **_network_options(self.settings.llm_base_url),
         )
         response.raise_for_status()
         body = response.json()
@@ -110,6 +124,7 @@ class LLMClient:
                     headers=_headers(self.settings.llm_api_key),
                     json=payload,
                     timeout=timeout_seconds,
+                    **_network_options(self.settings.llm_base_url),
                 )
                 response.raise_for_status()
                 body = response.json()
@@ -167,13 +182,16 @@ class EmbeddingClient:
             return {"ok": False, "detail": f"连接失败：{type(exc).__name__}"}
 
     def test(self) -> dict[str, Any]:
-        ping = self.ping()
-        if not ping["ok"]:
-            return ping
         if not self.settings.embedding_model.strip():
-            return {"ok": True, "detail": "Embedding 服务连接正常（未指定模型）"}
-        vector = self.embed(["供应商质量文件连接测试"], timeout_seconds=20)[0]
-        return {"ok": bool(vector), "detail": f"真实向量生成成功，维度 {len(vector)}"}
+            return {"ok": False, "detail": "Embedding 模型名称为空，无法执行真实向量测试"}
+        endpoint = f"{self.settings.embedding_base_url}/embeddings"
+        try:
+            vector = self.embed(["供应商质量文件连接测试"], timeout_seconds=20)[0]
+            return {"ok": bool(vector), "detail": f"真实向量生成成功，维度 {len(vector)}（{endpoint}）"}
+        except requests.RequestException as exc:
+            return {"ok": False, "detail": _request_error(endpoint, exc)}
+        except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+            return {"ok": False, "detail": f"Embedding 响应无效（{endpoint}）：{str(exc)[:240]}"}
 
     def embed(self, texts: list[str], timeout_seconds: int = 180) -> list[list[float]]:
         if not self.settings.embedding_model:
@@ -182,6 +200,7 @@ class EmbeddingClient:
             f"{self.settings.embedding_base_url}/embeddings",
             headers=_headers(self.settings.embedding_api_key),
             json={"model": self.settings.embedding_model, "input": texts}, timeout=timeout_seconds,
+            **_network_options(self.settings.embedding_base_url),
         )
         response.raise_for_status()
         data = sorted(response.json().get("data", []), key=lambda item: item.get("index", 0))
@@ -204,9 +223,14 @@ class MinerUClient:
         return {"Authorization": f"Bearer {self.settings.ocr_api_key}"} if self.settings.ocr_api_key else {}
 
     def test(self) -> dict[str, Any]:
-        response = requests.get(f"{self.settings.ocr_base_url}/health", headers=self.headers, timeout=10)
-        response.raise_for_status()
-        return {"ok": True, "detail": f"OCR 服务正常（HTTP {response.status_code}）"}
+        endpoint = f"{self.settings.ocr_base_url}/health"
+        try:
+            response = requests.get(endpoint, headers=self.headers, timeout=10,
+                                    **_network_options(self.settings.ocr_base_url))
+            response.raise_for_status()
+            return {"ok": True, "detail": f"OCR 服务正常（HTTP {response.status_code}，{endpoint}）"}
+        except requests.RequestException as exc:
+            return {"ok": False, "detail": _request_error(endpoint, exc)}
 
     def ocr(self, path: Path, timeout_seconds: int = 7200) -> str:
         safe_name = _mineru_safe_name(path.name)
@@ -216,6 +240,7 @@ class MinerUClient:
                 files={"files": (safe_name, handle, mimetypes.guess_type(path.name)[0] or "application/octet-stream")},
                 data={"backend": self.settings.ocr_backend, "lang_list": self.settings.ocr_lang, "return_md": "true"},
                 timeout=600,
+                **_network_options(self.settings.ocr_base_url),
             )
         response.raise_for_status()
         task_id = response.json().get("task_id")
@@ -223,7 +248,8 @@ class MinerUClient:
             raise RuntimeError("OCR 服务未返回 task_id")
         waited = 0
         while waited < timeout_seconds:
-            state = requests.get(f"{self.settings.ocr_base_url}/tasks/{task_id}", headers=self.headers, timeout=30)
+            state = requests.get(f"{self.settings.ocr_base_url}/tasks/{task_id}", headers=self.headers, timeout=30,
+                                 **_network_options(self.settings.ocr_base_url))
             state.raise_for_status()
             status = str(state.json().get("status", "unknown")).casefold()
             if status in {"completed", "success", "succeeded", "done", "finished"}:
@@ -233,7 +259,8 @@ class MinerUClient:
             time.sleep(6); waited += 6
         else:
             raise TimeoutError("OCR 任务超时")
-        result = requests.get(f"{self.settings.ocr_base_url}/tasks/{task_id}/result", headers=self.headers, timeout=120)
+        result = requests.get(f"{self.settings.ocr_base_url}/tasks/{task_id}/result", headers=self.headers, timeout=120,
+                              **_network_options(self.settings.ocr_base_url))
         result.raise_for_status()
         for payload in (result.json().get("results") or {}).values():
             markdown = payload.get("md_content") or payload.get("markdown") or payload.get("md")

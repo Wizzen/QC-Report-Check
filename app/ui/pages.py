@@ -405,6 +405,7 @@ def settings_page() -> None:
         except Exception as exc:
             st.error(str(exc))
     st.subheader("连接测试")
+    st.caption("连接测试使用已保存的配置。修改地址、模型或 API Key 后，请先点击上方“保存配置”。Ollama 11434 会自动补 `/v1`；其他服务请按其真实接口路径填写。")
     if st.button("一键测试全部服务", type="primary", icon=":material/network_check:", width="stretch"):
         _test_all_services(ctx.config_store.get())
     with st.container(horizontal=True):

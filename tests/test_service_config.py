@@ -6,7 +6,7 @@ from unittest.mock import Mock, patch
 import pytest
 
 from app.database import ReviewDatabase
-from app.integrations.clients import EmbeddingClient, LLMClient
+from app.integrations.clients import EmbeddingClient, LLMClient, MinerUClient
 from app.integrations.settings import ConfigStore, is_remote_url, normalize_openai_url
 
 
@@ -16,9 +16,11 @@ def _store(tmp_path: Path) -> ConfigStore:
 
 def test_ollama_url_is_normalized_to_openai_compatible_v1() -> None:
     assert normalize_openai_url("127.0.0.1:11434", ollama=True) == "http://127.0.0.1:11434/v1"
-    assert normalize_openai_url("http://127.0.0.1:1234") == "http://127.0.0.1:1234/v1"
+    assert normalize_openai_url("http://127.0.0.1:1234") == "http://127.0.0.1:1234"
+    assert normalize_openai_url("http://127.0.0.1:8081", ollama=True) == "http://127.0.0.1:8081"
     assert normalize_openai_url("https://api.example.com/v1") == "https://api.example.com/v1"
     assert not is_remote_url("http://192.168.1.20:11434/v1")
+    assert not is_remote_url("http://mineru-server.local:8888")
     assert is_remote_url("https://api.example.com/v1")
 
 
@@ -55,6 +57,37 @@ def test_embedding_validates_the_configured_dimension(tmp_path: Path) -> None:
     with patch("app.integrations.clients.requests.post", return_value=response):
         with pytest.raises(RuntimeError, match="维度不匹配"):
             EmbeddingClient(settings).embed(["test"])
+
+
+def test_embedding_test_calls_real_endpoint_without_models_probe(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    settings = store.save({"embedding_base_url": "http://127.0.0.1:8081", "embedding_model": "embed",
+                           "embedding_dimensions": 2})
+    response = Mock()
+    response.raise_for_status.return_value = None
+    response.json.return_value = {"data": [{"index": 0, "embedding": [0.1, 0.2]}]}
+
+    with patch("app.integrations.clients.requests.get") as get, \
+         patch("app.integrations.clients.requests.post", return_value=response) as post:
+        result = EmbeddingClient(settings).test()
+
+    assert result["ok"] is True
+    get.assert_not_called()
+    assert post.call_args.args[0] == "http://127.0.0.1:8081/embeddings"
+    assert post.call_args.kwargs["proxies"] == {"http": "", "https": ""}
+
+
+def test_ocr_local_health_bypasses_system_proxy_and_reports_endpoint(tmp_path: Path) -> None:
+    settings = _store(tmp_path).save({"ocr_base_url": "http://mineru-server.local:8888"})
+    response = Mock(status_code=200)
+    response.raise_for_status.return_value = None
+
+    with patch("app.integrations.clients.requests.get", return_value=response) as get:
+        result = MinerUClient(settings).test()
+
+    assert result["ok"] is True
+    assert "http://mineru-server.local:8888/health" in result["detail"]
+    assert get.call_args.kwargs["proxies"] == {"http": "", "https": ""}
 
 
 def test_service_presets_keep_keys_encrypted_and_can_be_applied(tmp_path: Path) -> None:
