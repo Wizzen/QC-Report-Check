@@ -54,4 +54,8 @@ class Finding:
     confidence: float = 1.0
     status: str = "AI发现"
     metadata: dict[str, Any] = field(default_factory=dict)
-
+    rule_code: str = ""
+    rule_version: int = 1
+    document_type: str = ""
+    extraction_confidence: float = 1.0
+    decision_confidence: float = 1.0

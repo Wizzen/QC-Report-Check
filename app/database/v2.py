@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import shutil
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator, Sequence
 
@@ -29,6 +30,10 @@ CREATE TABLE IF NOT EXISTS review_batches (
   activity TEXT NOT NULL DEFAULT '任务已进入本地队列', resource TEXT NOT NULL DEFAULT 'SQLite 本地任务队列',
   heartbeat_at TEXT NOT NULL DEFAULT '',
   error TEXT NOT NULL DEFAULT '', summary TEXT NOT NULL DEFAULT '{}',
+  template_snapshot TEXT NOT NULL DEFAULT '{}', rule_version INTEGER NOT NULL DEFAULT 1,
+  cancel_requested INTEGER NOT NULL DEFAULT 0, cancelled_at TEXT NOT NULL DEFAULT '',
+  deleted_at TEXT NOT NULL DEFAULT '', purge_after TEXT NOT NULL DEFAULT '',
+  started_at TEXT NOT NULL DEFAULT '', completed_at TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
   FOREIGN KEY(template_id) REFERENCES audit_templates(id) ON DELETE SET NULL
 );
@@ -42,6 +47,7 @@ CREATE TABLE IF NOT EXISTS documents (
   parse_status TEXT NOT NULL DEFAULT 'pending', ocr_status TEXT NOT NULL DEFAULT 'not_needed',
   index_status TEXT NOT NULL DEFAULT 'pending', index_fingerprint TEXT NOT NULL DEFAULT '',
   index_collection TEXT NOT NULL DEFAULT '', error TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
+  detected_type TEXT NOT NULL DEFAULT '', type_confidence REAL NOT NULL DEFAULT 0,
   FOREIGN KEY(library_code) REFERENCES document_libraries(code)
 );
 CREATE INDEX IF NOT EXISTS idx_documents_library ON documents(library_code, created_at);
@@ -85,6 +91,9 @@ CREATE TABLE IF NOT EXISTS findings (
   standard_page INTEGER NOT NULL DEFAULT 1, standard_clause TEXT NOT NULL DEFAULT '',
   logic TEXT NOT NULL DEFAULT '', suggestion TEXT NOT NULL DEFAULT '', confidence REAL NOT NULL DEFAULT 1,
   status TEXT NOT NULL DEFAULT 'AI发现', metadata TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL,
+  rule_code TEXT NOT NULL DEFAULT '', rule_version INTEGER NOT NULL DEFAULT 1,
+  document_type TEXT NOT NULL DEFAULT '', extraction_confidence REAL NOT NULL DEFAULT 1,
+  decision_confidence REAL NOT NULL DEFAULT 1,
   FOREIGN KEY(batch_id) REFERENCES review_batches(id) ON DELETE CASCADE
 );
 CREATE TABLE IF NOT EXISTS review_history (
@@ -114,6 +123,61 @@ CREATE TABLE IF NOT EXISTS jobs (
   created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
   FOREIGN KEY(batch_id) REFERENCES review_batches(id) ON DELETE CASCADE
 );
+CREATE TABLE IF NOT EXISTS audit_rules (
+  code TEXT PRIMARY KEY, group_name TEXT NOT NULL, title TEXT NOT NULL,
+  applies_to TEXT NOT NULL DEFAULT '[]', severity TEXT NOT NULL DEFAULT 'Review',
+  evaluator TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, current_version INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS audit_rule_versions (
+  rule_code TEXT NOT NULL, version INTEGER NOT NULL, parameters TEXT NOT NULL DEFAULT '{}',
+  change_reason TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
+  PRIMARY KEY(rule_code,version), FOREIGN KEY(rule_code) REFERENCES audit_rules(code) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS template_rule_versions (
+  template_id INTEGER NOT NULL, rule_code TEXT NOT NULL, rule_version INTEGER NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1, PRIMARY KEY(template_id,rule_code),
+  FOREIGN KEY(template_id) REFERENCES audit_templates(id) ON DELETE CASCADE,
+  FOREIGN KEY(rule_code,rule_version) REFERENCES audit_rule_versions(rule_code,version)
+);
+CREATE TABLE IF NOT EXISTS document_fields (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, document_id TEXT NOT NULL, field_key TEXT NOT NULL,
+  raw_value TEXT NOT NULL DEFAULT '', normalized_value TEXT NOT NULL DEFAULT '', unit TEXT NOT NULL DEFAULT '',
+  page INTEGER NOT NULL DEFAULT 1, source_text TEXT NOT NULL DEFAULT '', extraction_method TEXT NOT NULL DEFAULT '',
+  confidence REAL NOT NULL DEFAULT 1, bbox TEXT NOT NULL DEFAULT '', row_index INTEGER, column_index INTEGER,
+  FOREIGN KEY(document_id) REFERENCES documents(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_document_fields_key ON document_fields(document_id,field_key);
+CREATE TABLE IF NOT EXISTS document_entities (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, batch_id TEXT NOT NULL, entity_type TEXT NOT NULL,
+  normalized_value TEXT NOT NULL, display_value TEXT NOT NULL, members TEXT NOT NULL DEFAULT '[]',
+  FOREIGN KEY(batch_id) REFERENCES review_batches(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS evidence_regions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, document_id TEXT NOT NULL, page INTEGER NOT NULL,
+  source_text TEXT NOT NULL DEFAULT '', bbox TEXT NOT NULL DEFAULT '', method TEXT NOT NULL DEFAULT '', confidence REAL NOT NULL DEFAULT 1,
+  FOREIGN KEY(document_id) REFERENCES documents(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS finding_evidence (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, finding_id INTEGER NOT NULL, document_id TEXT,
+  page INTEGER NOT NULL DEFAULT 1, source_text TEXT NOT NULL DEFAULT '', bbox TEXT NOT NULL DEFAULT '',
+  evidence_type TEXT NOT NULL DEFAULT 'source', matched INTEGER NOT NULL DEFAULT 0,
+  FOREIGN KEY(finding_id) REFERENCES findings(id) ON DELETE CASCADE,
+  FOREIGN KEY(document_id) REFERENCES documents(id) ON DELETE SET NULL
+);
+CREATE TABLE IF NOT EXISTS review_feedback (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, finding_id INTEGER NOT NULL, batch_id TEXT NOT NULL,
+  action TEXT NOT NULL, correction TEXT NOT NULL DEFAULT '', evidence TEXT NOT NULL DEFAULT '', note TEXT NOT NULL DEFAULT '',
+  rule_code TEXT NOT NULL DEFAULT '', rule_version INTEGER NOT NULL DEFAULT 1,
+  service_fingerprint TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
+  FOREIGN KEY(finding_id) REFERENCES findings(id) ON DELETE CASCADE,
+  FOREIGN KEY(batch_id) REFERENCES review_batches(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS job_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, batch_id TEXT NOT NULL, stage TEXT NOT NULL,
+  activity TEXT NOT NULL, resource TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
+  FOREIGN KEY(batch_id) REFERENCES review_batches(id) ON DELETE CASCADE
+);
+CREATE VIRTUAL TABLE IF NOT EXISTS document_fts USING fts5(document_id UNINDEXED,page UNINDEXED,content,tokenize='unicode61');
 """
 
 
@@ -123,7 +187,22 @@ class ReviewDatabase:
     def __init__(self, path: Path):
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._backup_before_v04()
         self.initialize()
+
+    def _backup_before_v04(self) -> None:
+        if not self.path.is_file():
+            return
+        backup = self.path.with_suffix(self.path.suffix + ".pre-v0.4.0.bak")
+        if backup.exists():
+            return
+        try:
+            with sqlite3.connect(self.path) as connection:
+                columns = {row[1] for row in connection.execute("PRAGMA table_info(review_batches)").fetchall()}
+            if columns and "deleted_at" not in columns:
+                shutil.copy2(self.path, backup)
+        except sqlite3.DatabaseError:
+            return
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
@@ -147,12 +226,33 @@ class ReviewDatabase:
                 "activity": "TEXT NOT NULL DEFAULT '任务已进入本地队列'",
                 "resource": "TEXT NOT NULL DEFAULT 'SQLite 本地任务队列'",
                 "heartbeat_at": "TEXT NOT NULL DEFAULT ''",
+                "template_snapshot": "TEXT NOT NULL DEFAULT '{}'",
+                "rule_version": "INTEGER NOT NULL DEFAULT 1",
+                "cancel_requested": "INTEGER NOT NULL DEFAULT 0",
+                "cancelled_at": "TEXT NOT NULL DEFAULT ''",
+                "deleted_at": "TEXT NOT NULL DEFAULT ''",
+                "purge_after": "TEXT NOT NULL DEFAULT ''",
+                "started_at": "TEXT NOT NULL DEFAULT ''",
+                "completed_at": "TEXT NOT NULL DEFAULT ''",
             }.items():
                 if name not in columns:
                     connection.execute(f"ALTER TABLE review_batches ADD COLUMN {name} {declaration}")
             document_columns = {row[1] for row in connection.execute("PRAGMA table_info(documents)").fetchall()}
-            if "supplier_name" not in document_columns:
-                connection.execute("ALTER TABLE documents ADD COLUMN supplier_name TEXT NOT NULL DEFAULT ''")
+            for name, declaration in {
+                "supplier_name": "TEXT NOT NULL DEFAULT ''",
+                "detected_type": "TEXT NOT NULL DEFAULT ''",
+                "type_confidence": "REAL NOT NULL DEFAULT 0",
+            }.items():
+                if name not in document_columns:
+                    connection.execute(f"ALTER TABLE documents ADD COLUMN {name} {declaration}")
+            finding_columns = {row[1] for row in connection.execute("PRAGMA table_info(findings)").fetchall()}
+            for name, declaration in {
+                "rule_code": "TEXT NOT NULL DEFAULT ''", "rule_version": "INTEGER NOT NULL DEFAULT 1",
+                "document_type": "TEXT NOT NULL DEFAULT ''", "extraction_confidence": "REAL NOT NULL DEFAULT 1",
+                "decision_confidence": "REAL NOT NULL DEFAULT 1",
+            }.items():
+                if name not in finding_columns:
+                    connection.execute(f"ALTER TABLE findings ADD COLUMN {name} {declaration}")
             template_columns = {row[1] for row in connection.execute("PRAGMA table_info(audit_templates)").fetchall()}
             if "review_instructions" not in template_columns:
                 connection.execute("ALTER TABLE audit_templates ADD COLUMN review_instructions TEXT NOT NULL DEFAULT ''")
@@ -191,9 +291,16 @@ class ReviewDatabase:
         batch_id = str(uuid.uuid4())
         now = utcnow()
         name = f"审核批次 {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+        template = self.one("SELECT * FROM audit_templates WHERE id=?", (template_id,)) if template_id else None
+        rules = self.query(
+            """SELECT tr.rule_code,tr.rule_version,tr.enabled,r.title,r.group_name FROM template_rule_versions tr
+               JOIN audit_rules r ON r.code=tr.rule_code WHERE tr.template_id=? ORDER BY tr.rule_code""", (template_id,)
+        ) if template_id else []
+        rule_version = max([int(row["rule_version"]) for row in rules] or [1])
+        snapshot = json.dumps({"template": template or {}, "rules": rules}, ensure_ascii=False)
         self.execute(
-            "INSERT INTO review_batches(id,name,template_id,heartbeat_at,created_at,updated_at) VALUES(?,?,?,?,?,?)",
-            (batch_id, name, template_id, now, now, now),
+            "INSERT INTO review_batches(id,name,template_id,template_snapshot,rule_version,heartbeat_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+            (batch_id, name, template_id, snapshot, rule_version, now, now, now),
         )
         self.execute(
             "INSERT INTO jobs(id,batch_id,created_at,updated_at) VALUES(?,?,?,?)",
@@ -218,7 +325,8 @@ class ReviewDatabase:
         )
 
     def update_batch(self, batch_id: str, **values: Any) -> None:
-        allowed = {"status", "stage", "progress", "current_file", "activity", "resource", "heartbeat_at", "error", "summary"}
+        allowed = {"status", "stage", "progress", "current_file", "activity", "resource", "heartbeat_at", "error", "summary",
+                   "cancel_requested", "cancelled_at", "deleted_at", "purge_after", "supplier_name", "started_at", "completed_at"}
         payload = {key: value for key, value in values.items() if key in allowed}
         if not payload:
             return
@@ -228,8 +336,9 @@ class ReviewDatabase:
         columns = ",".join(f"{key}=?" for key in payload)
         self.execute(f"UPDATE review_batches SET {columns} WHERE id=?", [*payload.values(), batch_id])
 
-    def update_finding_status(self, finding_id: int, new_status: str, note: str = "") -> None:
-        row = self.one("SELECT status FROM findings WHERE id=?", (finding_id,))
+    def update_finding_status(self, finding_id: int, new_status: str, note: str = "",
+                              correction: str = "", evidence: str = "", service_fingerprint: str = "") -> None:
+        row = self.one("SELECT status,batch_id,rule_code,rule_version FROM findings WHERE id=?", (finding_id,))
         if not row:
             raise ValueError("问题不存在")
         with self.connect() as connection:
@@ -238,12 +347,73 @@ class ReviewDatabase:
                 "INSERT INTO review_history(finding_id,old_status,new_status,note,changed_at) VALUES(?,?,?,?,?)",
                 (finding_id, row["status"], new_status, note, utcnow()),
             )
+            connection.execute(
+                """INSERT INTO review_feedback(finding_id,batch_id,action,correction,evidence,note,rule_code,rule_version,
+                   service_fingerprint,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                (finding_id, row["batch_id"], new_status, correction, evidence, note, row["rule_code"],
+                 row["rule_version"], service_fingerprint, utcnow()),
+            )
+
+    def request_cancel(self, batch_id: str) -> bool:
+        row = self.one("SELECT status FROM review_batches WHERE id=? AND deleted_at=''", (batch_id,))
+        if not row or row["status"] in {"completed", "failed", "cancelled"}:
+            return False
+        now = utcnow()
+        if row["status"] == "queued":
+            self.execute("UPDATE jobs SET status='cancelled',updated_at=? WHERE batch_id=?", (now, batch_id))
+            self.update_batch(batch_id, status="cancelled", stage="已取消", progress=0, cancel_requested=1,
+                              cancelled_at=now, activity="任务在开始前已取消", resource="本机任务队列")
+        else:
+            self.execute("UPDATE jobs SET status='cancel_requested',updated_at=? WHERE batch_id=?", (now, batch_id))
+            self.update_batch(batch_id, status="cancel_requested", cancel_requested=1,
+                              stage="正在停止", activity="等待当前安全检查点后停止", resource="本地 worker")
+        return True
+
+    def is_cancel_requested(self, batch_id: str) -> bool:
+        row = self.one("SELECT cancel_requested,deleted_at FROM review_batches WHERE id=?", (batch_id,))
+        return bool(row and (row["cancel_requested"] or row["deleted_at"]))
+
+    def mark_cancelled(self, batch_id: str) -> None:
+        now = utcnow()
+        self.update_batch(batch_id, status="cancelled", stage="已取消", cancelled_at=now,
+                          activity="审核已在安全检查点停止，未发布不完整结论", resource="本地 worker")
+        self.execute("UPDATE jobs SET status='cancelled',updated_at=? WHERE batch_id=?", (now, batch_id))
+
+    def soft_delete_batch(self, batch_id: str) -> None:
+        self.request_cancel(batch_id)
+        now = datetime.now(timezone.utc)
+        self.update_batch(batch_id, deleted_at=now.isoformat(timespec="seconds"),
+                          purge_after=(now + timedelta(days=30)).isoformat(timespec="seconds"))
+
+    def restore_batch(self, batch_id: str) -> None:
+        self.update_batch(batch_id, deleted_at="", purge_after="")
+
+    def purge_batch(self, batch_id: str) -> list[dict[str, Any]]:
+        """Permanently remove a trashed batch and return private documents for filesystem cleanup."""
+        batch = self.one("SELECT deleted_at,purge_after FROM review_batches WHERE id=?", (batch_id,))
+        if not batch or not batch["deleted_at"]:
+            raise ValueError("仅回收站中的审核记录可以永久删除")
+        if batch["purge_after"] and datetime.fromisoformat(batch["purge_after"]) > datetime.now(timezone.utc):
+            raise ValueError("回收站保留期尚未结束，当前只能恢复记录")
+        private = self.query(
+            """SELECT d.* FROM batch_documents bd JOIN documents d ON d.id=bd.document_id
+               WHERE bd.batch_id=? AND bd.role IN ('supplier','supplemental_basis')
+               AND NOT EXISTS (SELECT 1 FROM batch_documents other WHERE other.document_id=d.id AND other.batch_id<>?)""",
+            (batch_id, batch_id),
+        )
+        with self.connect() as connection:
+            connection.execute("DELETE FROM review_batches WHERE id=?", (batch_id,))
+            connection.executemany("DELETE FROM documents WHERE id=?", [(row["id"],) for row in private])
+        return private
 
     def claim_job(self) -> dict[str, Any] | None:
         """Atomically claim the oldest queued job for the single local worker."""
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            row = connection.execute("SELECT * FROM jobs WHERE status='queued' ORDER BY created_at LIMIT 1").fetchone()
+            row = connection.execute(
+                """SELECT j.* FROM jobs j JOIN review_batches b ON b.id=j.batch_id
+                   WHERE j.status='queued' AND b.deleted_at='' AND b.cancel_requested=0 ORDER BY j.created_at LIMIT 1"""
+            ).fetchone()
             if not row:
                 return None
             now = utcnow()
@@ -259,11 +429,15 @@ class ReviewDatabase:
         """Recover work interrupted when this project's single worker was stopped."""
         now = utcnow()
         with self.connect() as connection:
-            rows = connection.execute("SELECT batch_id FROM jobs WHERE status='running'").fetchall()
+            rows = connection.execute(
+                """SELECT j.batch_id FROM jobs j JOIN review_batches b ON b.id=j.batch_id
+                   WHERE j.status='running' AND b.cancel_requested=0 AND b.deleted_at=''"""
+            ).fetchall()
             if not rows:
                 return 0
             connection.execute(
-                "UPDATE jobs SET status='queued',locked_at=NULL,error='',updated_at=? WHERE status='running'", (now,)
+                """UPDATE jobs SET status='queued',locked_at=NULL,error='',updated_at=? WHERE status='running'
+                   AND batch_id IN (SELECT id FROM review_batches WHERE cancel_requested=0 AND deleted_at='')""", (now,)
             )
             connection.executemany(
                 """UPDATE review_batches SET status='queued',stage='恢复审核',activity='上次审核被中断，已重新进入队列',

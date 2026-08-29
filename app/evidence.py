@@ -4,17 +4,19 @@ import pymupdf
 
 
 def render_pdf_evidence_bytes(
-    path_text: str, page_number: int, source_text: str, actual: str, item: str
+    path_text: str, page_number: int, source_text: str, actual: str, item: str,
+    bbox: tuple[float, float, float, float] | None = None,
 ) -> tuple[bytes, bool]:
     """Render a focused PDF screenshot and outline exact source evidence when found."""
     with pymupdf.open(path_text) as document:
         page_index = max(0, min(page_number - 1, document.page_count - 1))
         page = document.load_page(page_index)
-        matches: list[pymupdf.Rect] = []
-        for candidate in evidence_candidates(source_text, actual, item):
-            matches = page.search_for(candidate)
-            if matches:
-                break
+        matches: list[pymupdf.Rect] = [pymupdf.Rect(*bbox)] if bbox and len(bbox) == 4 else []
+        if not matches:
+            for candidate in evidence_candidates(source_text, actual, item):
+                matches = page.search_for(candidate)
+                if matches:
+                    break
         clip = page.rect
         if matches:
             focus = matches[0]

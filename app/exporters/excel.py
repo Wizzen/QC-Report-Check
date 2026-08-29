@@ -61,6 +61,8 @@ def export_batch(db: ReviewDatabase, batch_id: str) -> bytes:
     )
     rows = [{
         "序号": index, "审核批次": batch["name"], "审核模板": batch.get("template_name") or "",
+        "供应商": batch.get("supplier_name") or "", "规则编号": finding.get("rule_code") or "",
+        "规则版本": finding.get("rule_version") or 1, "文档类型": finding.get("document_type") or "",
         "问题等级": finding["severity"], "问题类别": finding["category"], "文件名称": finding["source_file"],
         "页码": finding["source_page"], "检查项目": finding["item"], "实际内容": finding["actual"],
         "要求内容": finding["requirement"], "对应标准": finding["standard_file"],
@@ -69,14 +71,16 @@ def export_batch(db: ReviewDatabase, batch_id: str) -> bytes:
         "AI置信度": finding["confidence"], "人工状态": finding["status"], "备注": "",
     } for index, finding in enumerate(findings, start=1)]
     levels = ("Critical", "Major", "Minor", "Warning", "Review")
-    summary = [{"指标": "审核批次", "内容": batch["name"]}, {"指标": "文件数量", "内容": len(documents)},
+    summary = [{"指标": "审核批次", "内容": batch["name"]}, {"指标": "供应商", "内容": batch.get("supplier_name") or "未识别"},
+               {"指标": "模板与规则版本", "内容": f"{batch.get('template_name') or '-'} / v{batch.get('rule_version') or 1}"},
+               {"指标": "文件数量", "内容": len(documents)},
                {"指标": "问题数量", "内容": len(findings)},
                *({"指标": level, "内容": sum(item["severity"] == level for item in findings)} for level in levels)]
     basis = [{"文件名称": item["original_name"], "类别": item["document_kind"], "角色": item["role"],
               "优先级": item["priority"], "页数": item["page_count"], "解析状态": item["parse_status"],
               "索引状态": item["index_status"]} for item in documents if item["role"] != "supplier"]
     output = BytesIO()
-    columns = ["序号", "审核批次", "审核模板", "问题等级", "问题类别", "文件名称", "页码", "检查项目", "实际内容",
+    columns = ["序号", "审核批次", "审核模板", "供应商", "规则编号", "规则版本", "文档类型", "问题等级", "问题类别", "文件名称", "页码", "检查项目", "实际内容",
                "要求内容", "对应标准", "标准页码", "标准条款", "判断逻辑", "问题描述", "整改建议", "AI置信度", "人工状态", "备注"]
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         pd.DataFrame(rows, columns=columns).to_excel(writer, sheet_name="问题清单", index=False)

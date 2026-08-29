@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import json
 from io import BytesIO
 from pathlib import Path
 
@@ -206,6 +207,8 @@ def _finding_detail(index: int, finding: dict[str, object], file_lookup: dict[st
     metadata = Table([
         [Paragraph("类别", styles["meta_label"]), Paragraph(_safe(str(finding.get("category") or "-")), styles["meta_value"]),
          Paragraph("人工状态", styles["meta_label"]), Paragraph(_safe(str(finding.get("status") or "-")), styles["meta_value"])],
+        [Paragraph("规则", styles["meta_label"]), Paragraph(_safe(f"{finding.get('rule_code') or '历史规则'} / v{finding.get('rule_version') or 1}"), styles["meta_value"]),
+         Paragraph("文档类型", styles["meta_label"]), Paragraph(_safe(str(finding.get("document_type") or "-")), styles["meta_value"])],
         [Paragraph("供应商文件", styles["meta_label"]), Paragraph(_safe(str(finding.get("source_file") or "-")), styles["meta_value"]),
          Paragraph("原页", styles["meta_label"]), Paragraph(str(finding.get("source_page") or 1), styles["meta_value"])],
         [Paragraph("审核依据", styles["meta_label"]), Paragraph(_safe(str(finding.get("standard_file") or "模板内置规则")), styles["meta_value"]),
@@ -222,12 +225,25 @@ def _finding_detail(index: int, finding: dict[str, object], file_lookup: dict[st
         blocks.append(KeepTogether([Paragraph(label, styles["detail_label"]),
                                     Paragraph(_safe(value[:4000]), styles["detail_value"]), Spacer(1, 3 * mm)]))
 
-    source = file_lookup.get(str(finding.get("source_file") or ""))
-    screenshot = _matched_screenshot(source, finding)
-    if screenshot:
-        blocks.extend([CondPageBreak(65 * mm), Spacer(1, 2 * mm), Paragraph("原报告问题位置", styles["detail_label"]),
-                       Spacer(1, 2 * mm), _report_image(screenshot),
-                       Paragraph("红框为系统在原报告中精确定位的证据。", styles["image_caption"])])
+    try:
+        evidence = json.loads(str(finding.get("metadata") or "{}")).get("evidence", [])
+    except (ValueError, TypeError):
+        evidence = []
+    if not evidence:
+        evidence = [{"file": finding.get("source_file"), "page": finding.get("source_page"),
+                     "source_text": finding.get("source_text"), "evidence_type": "source"}]
+    for item in evidence[:4]:
+        if item.get("evidence_type") == "absence":
+            blocks.extend([Paragraph("缺失证明", styles["detail_label"]),
+                           Paragraph(_safe(str(item.get("source_text") or "系统已扫描适用页面但未命中该字段")), styles["detail_value"])])
+            continue
+        source = file_lookup.get(str(item.get("file") or finding.get("source_file") or ""))
+        screenshot = _matched_screenshot(source, {**finding, "source_page": item.get("page"), "source_text": item.get("source_text"),
+                                                   "bbox": item.get("bbox")})
+        if screenshot:
+            blocks.extend([CondPageBreak(65 * mm), Spacer(1, 2 * mm), Paragraph("原报告问题位置", styles["detail_label"]),
+                           Spacer(1, 2 * mm), _report_image(screenshot),
+                           Paragraph(f"{_safe(str(item.get('file') or '原报告'))} · 第 {item.get('page') or 1} 页，红框为精确定位证据。", styles["image_caption"])])
     return blocks
 
 
@@ -238,9 +254,11 @@ def _matched_screenshot(source: dict[str, object] | None, finding: dict[str, obj
     if not path.is_file() or path.suffix.casefold() != ".pdf":
         return None
     try:
+        bbox_value = finding.get("bbox")
+        bbox = tuple(float(value) for value in bbox_value) if isinstance(bbox_value, list) and len(bbox_value) == 4 else None
         image, matched = render_pdf_evidence_bytes(
             str(path), int(finding.get("source_page") or 1), str(finding.get("source_text") or ""),
-            str(finding.get("actual") or ""), str(finding.get("item") or ""),
+            str(finding.get("actual") or ""), str(finding.get("item") or ""), bbox,
         )
         return image if matched else None
     except (OSError, ValueError, RuntimeError):

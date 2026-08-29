@@ -6,6 +6,7 @@ from app.models import ExtractedItem, PageText, Requirement
 
 
 LABELS: dict[str, list[str]] = {
+    "report_number": ["报告编号", "Report No", "Report Number", "Certificate No"],
     "material_grade": ["材料牌号", "材质", "Material Grade", "Grade"],
     "heat_number": ["炉号", "Heat No", "Heat Number"],
     "batch_number": ["批次号", "Batch No", "Lot No", "批号"],
@@ -13,6 +14,7 @@ LABELS: dict[str, list[str]] = {
     "po_number": ["PO号", "采购订单号", "PO No"],
     "drawing_number": ["图号", "Drawing No"],
     "product_model": ["型号", "Model"],
+    "specification": ["规格", "Specification", "Product Size", "Dimensions"],
     "wdc_number": ["WDC", "WDC No", "WDC号"],
 }
 
@@ -28,7 +30,7 @@ TEST_ALIASES: dict[str, list[str]] = {
     "Ni": ["Ni", "镍"], "Mo": ["Mo", "钼"],
 }
 
-UNIT = r"(?:GPa|MPa|N/mm(?:²|2)|Pa|mm|cm|μm|um|%|ppm|°C|℃|J|HV|HBW)?"
+UNIT = r"(?:GPa|MPa|ksi|N/mm(?:²|2)|Pa|mm|cm|μm|um|inch|in\.?|%|ppm|°C|℃|J|HV|HBW)?"
 NUMBER = r"[-+]?\d+(?:\.\d+)?"
 
 

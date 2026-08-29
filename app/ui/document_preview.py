@@ -40,8 +40,9 @@ def render_pdf_page(path_text: str, modified_ns: int, page_number: int) -> bytes
 
 @st.cache_data(max_entries=24, show_spinner=False)
 def render_pdf_evidence(
-    path_text: str, modified_ns: int, page_number: int, source_text: str, actual: str, item: str
+    path_text: str, modified_ns: int, page_number: int, source_text: str, actual: str, item: str,
+    bbox: tuple[float, float, float, float] | None = None,
 ) -> tuple[bytes, bool]:
     """Render a focused PDF screenshot and outline the matched evidence when possible."""
     del modified_ns
-    return render_pdf_evidence_bytes(path_text, page_number, source_text, actual, item)
+    return render_pdf_evidence_bytes(path_text, page_number, source_text, actual, item, bbox)
