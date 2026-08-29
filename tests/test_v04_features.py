@@ -14,6 +14,12 @@ def test_withdrawn_versioned_rule_tables_are_removed(tmp_path: Path) -> None:
     assert not {"audit_rules", "audit_rule_versions", "template_rule_versions"} & names
 
 
+def test_windows_launcher_does_not_require_removed_vector_dependency() -> None:
+    launcher = (Path(__file__).parents[1] / "start.bat").read_text(encoding="utf-8")
+
+    assert "chromadb" not in launcher.casefold()
+
+
 def test_cancel_queued_job_is_immediate(tmp_path: Path) -> None:
     db = ReviewDatabase(tmp_path / "review.db")
     batch_id = db.create_batch(None)
