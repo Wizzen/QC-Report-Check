@@ -18,11 +18,10 @@ from app.auditing.expert_review import (
     FASTENER_REVIEW_INSTRUCTIONS,
     FASTENER_TEMPLATE_NAME,
     ExpertDocument,
-    build_expert_prompt,
+    build_rule_task_prompt,
     deterministic_fastener_audit,
     extract_supplier_names,
-    findings_from_llm,
-    supplier_names_from_llm,
+    rule_evaluation_from_llm,
 )
 from app.database import ReviewDatabase
 from app.database.v2 import utcnow
@@ -30,8 +29,7 @@ from app.extractors import extract_filename_items, extract_items, extract_requir
 from app.integrations import ConfigStore, LLMClient, MinerUClient
 from app.models import ExtractedItem, Finding, PageText, Requirement
 from app.parsers import parse_document
-from app.rag.vector_index import DocumentVectorIndex
-from app.rules import AuditEngine, GENERIC_TEMPLATE_NAME, GenericDocument, classify_document, run_generic_rules, seed_generic_rules
+from app.rules import AuditEngine
 from app.utils import save_upload
 
 
@@ -49,10 +47,9 @@ class ReviewService:
         self.db, self.config_store = db, config_store
         self.uploads, self.standards, self.vector_root = uploads, standards, vector_root
         self.max_bytes = max_upload_mb * 1024 * 1024
-        seed_generic_rules(self.db)
         self._ensure_fastener_template()
         self._backfill_supplier_names()
-        self._backfill_v04_metadata()
+        self._backfill_search_evidence()
 
     def _ensure_fastener_template(self) -> None:
         row = self.db.one("SELECT id FROM audit_templates WHERE name=?", (FASTENER_TEMPLATE_NAME,))
@@ -82,23 +79,22 @@ class ReviewService:
             self.db.execute("UPDATE documents SET supplier_name=? WHERE id=?", (supplier_name, row["id"]))
             self._refresh_supplier_names_for_document(row["id"])
 
-    def _backfill_v04_metadata(self) -> None:
+    def _backfill_search_evidence(self) -> None:
+        """Keep search and screenshot evidence for older documents without classifying them."""
         rows = self.db.query(
             """SELECT d.* FROM documents d WHERE d.parse_status='completed' AND
-               (d.detected_type='' OR NOT EXISTS (SELECT 1 FROM document_fts f WHERE f.document_id=d.id))"""
+               (NOT EXISTS (SELECT 1 FROM document_fts f WHERE f.document_id=d.id)
+                OR NOT EXISTS (SELECT 1 FROM document_fields f WHERE f.document_id=d.id))"""
         )
         for row in rows:
             pages = _expert_document(row).pages
-            kind, confidence = classify_document(row["original_name"], pages)
             path = Path(str(row["stored_path"]))
             fields = self.db.query("SELECT * FROM extracted_data WHERE document_id=?", (row["id"],))
             with self.db.connect() as connection:
-                connection.execute("UPDATE documents SET detected_type=?,type_confidence=? WHERE id=?", (kind, confidence, row["id"]))
-                connection.execute("DELETE FROM document_fts WHERE document_id=?", (row["id"],))
-                connection.executemany("INSERT INTO document_fts(document_id,page,content) VALUES(?,?,?)",
-                                       [(row["id"], page.page, page.text) for page in pages if page.text.strip()])
-                existing = connection.execute("SELECT 1 FROM document_fields WHERE document_id=? LIMIT 1", (row["id"],)).fetchone()
-                if not existing:
+                if not connection.execute("SELECT 1 FROM document_fts WHERE document_id=? LIMIT 1", (row["id"],)).fetchone():
+                    connection.executemany("INSERT INTO document_fts(document_id,page,content) VALUES(?,?,?)",
+                                           [(row["id"], page.page, page.text) for page in pages if page.text.strip()])
+                if not connection.execute("SELECT 1 FROM document_fields WHERE document_id=? LIMIT 1", (row["id"],)).fetchone():
                     connection.executemany(
                         """INSERT INTO document_fields(document_id,field_key,raw_value,normalized_value,unit,page,source_text,
                            extraction_method,confidence,bbox) VALUES(?,?,?,?,?,?,?,?,?,?)""",
@@ -182,7 +178,7 @@ class ReviewService:
                                progress=5 + int(40 * index / max(1, len(rows))),
                                activity=f"准备处理第 {index + 1}/{len(rows)} 份文件",
                                resource="本机文件系统")
-                if row["parse_status"] != "completed" or row["index_fingerprint"] != self.config_store.get().embedding_fingerprint:
+                if row["parse_status"] != "completed":
                     self.process_document(row["id"], requirement_priority=int(row["priority"]) if row["role"] != "supplier" else None,
                                           batch_id=batch_id)
                 self._check_cancel(batch_id)
@@ -278,7 +274,6 @@ class ReviewService:
         elif sparse_pages:
             ocr_status = "pending"
         raw_text = "\n\n".join(page.text for page in pages)
-        detected_type, type_confidence = classify_document(row["original_name"], pages)
         supplier_name = " / ".join(extract_supplier_names(pages)) if row["library_code"] == "supplier" else ""
         self._activity(batch_id, activity=f"正在从 {row['original_name']} 提取结构化字段和审核条款",
                        resource="本机 CPU · 正则提取器")
@@ -313,24 +308,20 @@ class ReviewService:
                       req.source_page, req.clause, requirement_priority or PRIORITIES.get(row["document_kind"], 3),
                       int(req.required), 1, utcnow()) for req in requirements],
                 )
-        self._activity(batch_id, activity=f"正在为 {row['original_name']} 生成向量并写入独立索引",
-                       resource=_resource("Embedding", settings.embedding_base_url, settings.embedding_model))
-        count, index_status = DocumentVectorIndex(self.vector_root, settings).index(document_id, pages)
         self._check_cancel(batch_id)
         self.db.execute(
-            """UPDATE documents SET page_count=?,page_text=?,raw_text=?,markdown=?,supplier_name=?,detected_type=?,type_confidence=?,parse_status='completed',
+            """UPDATE documents SET page_count=?,page_text=?,raw_text=?,markdown=?,supplier_name=?,parse_status='completed',
                ocr_status=?,index_status=?,index_fingerprint=?,index_collection=?,error='' WHERE id=?""",
             (len(pages), json.dumps([{"page": p.page, "text": p.text} for p in pages], ensure_ascii=False),
-             raw_text, raw_text, supplier_name, detected_type, type_confidence, ocr_status, index_status, settings.embedding_fingerprint,
-             f"{document_id}/document_chunks" if count else "", document_id),
+             raw_text, raw_text, supplier_name, ocr_status, "not_used", "", "", document_id),
         )
         self._refresh_supplier_names_for_document(document_id)
-        self._activity(batch_id, activity=f"{row['original_name']} 已完成解析、提取和索引",
-                       resource=f"ChromaDB · {index_status}")
+        self._activity(batch_id, activity=f"{row['original_name']} 已完成解析和结构化提取",
+                       resource="本机 CPU · 无向量模型")
 
     def _audit(self, batch_id: str) -> list[Finding]:
         document_rows = self.db.query(
-            """SELECT d.id,d.original_name,d.stored_path,d.page_text,d.ocr_status,d.supplier_name,d.detected_type,d.type_confidence FROM batch_documents bd JOIN documents d ON d.id=bd.document_id
+            """SELECT d.id,d.original_name,d.stored_path,d.page_text,d.ocr_status,d.supplier_name FROM batch_documents bd JOIN documents d ON d.id=bd.document_id
                WHERE bd.batch_id=? AND bd.role='supplier'""", (batch_id,)
         )
         documents: dict[str, list[ExtractedItem]] = {}
@@ -353,35 +344,10 @@ class ReviewService:
         requirements = [Requirement(row["item"], row["operator"], _number_or_text(row["value"]),
             _optional_float(row["upper_value"]), row["unit"], row["raw"], row["source_file"], row["source_page"],
             row["clause"], bool(row["required"])) for row in rule_rows]
-        batch = self.db.one("SELECT template_id,template_snapshot FROM review_batches WHERE id=?", (batch_id,))
+        batch = self.db.one("SELECT template_id FROM review_batches WHERE id=?", (batch_id,))
         template = self.db.one("SELECT * FROM audit_templates WHERE id=?", (batch["template_id"],)) if batch and batch["template_id"] else None
         findings = AuditEngine().audit(documents, requirements)
-        generic_documents: list[GenericDocument] = []
-        for document in document_rows:
-            fields = documents.get(document["original_name"], [])
-            pages = _expert_document(document).pages
-            kind, confidence = classify_document(document["original_name"], pages)
-            generic_documents.append(GenericDocument(document["id"], document["original_name"], Path(document["stored_path"]),
-                                                       pages, fields, kind, confidence, str(document.get("supplier_name") or "")))
-        if template and template["name"] == GENERIC_TEMPLATE_NAME:
-            try:
-                snapshot_rules = json.loads(batch.get("template_snapshot") or "{}").get("rules", []) if batch else []
-            except (ValueError, TypeError):
-                snapshot_rules = []
-            if snapshot_rules:
-                enabled_codes = {row["rule_code"] for row in snapshot_rules if row.get("enabled")}
-                version_lookup = {row["rule_code"]: int(row.get("rule_version") or 1) for row in snapshot_rules}
-            else:
-                current_rules = self.db.query(
-                    "SELECT rule_code,rule_version FROM template_rule_versions WHERE template_id=? AND enabled=1", (template["id"],)
-                )
-                enabled_codes = {row["rule_code"] for row in current_rules}
-                version_lookup = {row["rule_code"]: int(row["rule_version"]) for row in current_rules}
-            generic_findings = run_generic_rules(generic_documents, enabled_codes)
-            for finding in generic_findings:
-                finding.rule_version = version_lookup.get(finding.rule_code, 1)
-            findings.extend(generic_findings)
-        if template and template["name"] == FASTENER_TEMPLATE_NAME:
+        if template and _uses_fastener_audit(template):
             expert_documents = [_expert_document(row) for row in document_rows]
             findings.extend(deterministic_fastener_audit(expert_documents))
         if not rule_rows and not (template and template.get("review_instructions", "").strip()):
@@ -391,9 +357,6 @@ class ReviewService:
 
     def _expert_review(self, batch_id: str, findings: list[Finding]) -> list[Finding]:
         settings = self.config_store.get()
-        if not settings.llm_base_url:
-            self._activity(batch_id, activity="未配置 LLM Base URL，保留确定性专家规则结果", resource="本机规则引擎")
-            return findings
         rows = self.db.query(
             """SELECT d.id,d.original_name,d.stored_path,d.page_text,d.ocr_status FROM batch_documents bd
                JOIN documents d ON d.id=bd.document_id WHERE bd.batch_id=? AND bd.role='supplier'""", (batch_id,)
@@ -403,39 +366,86 @@ class ReviewService:
         if not documents:
             return findings
         batch = self.db.one("SELECT template_id FROM review_batches WHERE id=?", (batch_id,))
-        template = self.db.one("SELECT review_instructions FROM audit_templates WHERE id=?", (batch["template_id"],)) if batch and batch["template_id"] else None
+        template = self.db.one("SELECT required_items,review_instructions FROM audit_templates WHERE id=?", (batch["template_id"],)) if batch and batch["template_id"] else None
         instructions = str(template.get("review_instructions") or "") if template else ""
+        try:
+            tasks = [str(item).strip() for item in json.loads(str(template.get("required_items") or "[]")) if str(item).strip()] if template else []
+        except (ValueError, TypeError):
+            tasks = []
+        with self.db.connect() as connection:
+            connection.execute("DELETE FROM rule_evaluations WHERE batch_id=?", (batch_id,))
+            connection.executemany(
+                "INSERT INTO rule_evaluations(batch_id,task_index,task_name,status) VALUES(?,?,?,'pending')",
+                [(batch_id, index, task) for index, task in enumerate(tasks, 1)],
+            )
+        if not tasks:
+            self._activity(batch_id, activity="模板没有配置必检项目，跳过 LLM 独立规则审核", resource="本机规则引擎")
+            return findings
+        if not settings.llm_base_url:
+            self.db.execute("UPDATE rule_evaluations SET status='调用失败',error='未配置 LLM Base URL',completed_at=? WHERE batch_id=?",
+                            (utcnow(), batch_id))
+            self._activity(batch_id, activity="未配置 LLM，独立规则任务未执行，保留确定性结果", resource="本机规则引擎")
+            return [*findings, Finding("待人工确认", "Review", "独立规则审核未执行",
+                f"模板包含 {len(tasks)} 条必检任务，但未配置 LLM。", requirement="逐条完成独立 LLM 或人工审核")]
         basis_rows = self.db.query(
             """SELECT d.original_name,d.raw_text FROM batch_documents bd JOIN documents d ON d.id=bd.document_id
                WHERE bd.batch_id=? AND bd.role IN ('selected_basis','supplemental_basis') ORDER BY bd.priority""", (batch_id,)
         )
-        basis = self._hybrid_basis_context(batch_id, basis_rows)
-        self._activity(batch_id, activity="正在调用 LLM 逐页复核文件类型、追溯关系和表格证据",
+        basis = self._basis_context(batch_id, basis_rows)
+        self._activity(batch_id, activity=f"准备逐条执行 {len(tasks)} 个独立 LLM 审核任务",
                        resource=_resource("LLM", settings.llm_base_url, settings.llm_model))
-        try:
-            payload = LLMClient(settings).generate_json(build_expert_prompt(documents, instructions, findings, basis))
+        client = LLMClient(settings)
+        discovered: list[Finding] = []
+        failed_tasks: list[str] = []
+        for index, task in enumerate(tasks, 1):
             self._check_cancel(batch_id)
-            discovered = findings_from_llm(payload, documents)
-            llm_names = supplier_names_from_llm(payload, documents)
-            for row in rows:
-                names = [*extract_supplier_names(_expert_document(row)), *llm_names.get(row["original_name"], [])]
-                combined = _join_names(names)
-                if combined:
-                    self.db.execute("UPDATE documents SET supplier_name=? WHERE id=?", (combined, row["id"]))
-                    self._refresh_supplier_names_for_document(row["id"])
-            self._activity(batch_id, progress=94, activity=f"LLM 专家复核新增 {len(discovered)} 个有原页证据的问题",
-                           resource=_resource("LLM", settings.llm_base_url, settings.llm_model))
-            return _dedupe_findings([*findings, *discovered])
-        except ReviewCancelled:
-            raise
-        except Exception as exc:
-            LOGGER.warning("LLM 专家复核失败，保留确定性结果：%s", type(exc).__name__)
-            self._activity(batch_id, progress=94, activity="LLM 专家复核未完成，已保留确定性规则结果",
-                           resource=_resource("LLM", settings.llm_base_url, settings.llm_model))
-            return findings
+            started = utcnow()
+            self.db.execute("UPDATE rule_evaluations SET status='审核中',started_at=?,error='' WHERE batch_id=? AND task_index=?",
+                            (started, batch_id, index))
+            self._activity(
+                batch_id, progress=82 + int(12 * (index - 1) / max(1, len(tasks))),
+                activity=f"LLM 正在独立判断第 {index}/{len(tasks)} 条：{task}",
+                resource=_resource("LLM", settings.llm_base_url, settings.llm_model),
+            )
+            try:
+                task_documents = _rule_evidence_documents(documents, task)
+                payload = client.generate_json(
+                    build_rule_task_prompt(task, task_documents, instructions, findings, basis),
+                    retries=0, timeout_seconds=90, max_tokens=900,
+                )
+                evaluation, finding = rule_evaluation_from_llm(payload, task, documents)
+                self.db.execute(
+                    """UPDATE rule_evaluations SET status=?,conclusion=?,source_file=?,source_page=?,evidence=?,evidence_type=?,
+                       actual=?,requirement=?,logic=?,suggestion=?,confidence=?,completed_at=? WHERE batch_id=? AND task_index=?""",
+                    (evaluation["status"], evaluation["conclusion"], evaluation["source_file"], evaluation["source_page"],
+                     evaluation["evidence"], evaluation["evidence_type"], evaluation["actual"], evaluation["requirement"],
+                     evaluation["logic"], evaluation["suggestion"], evaluation["confidence"], utcnow(), batch_id, index),
+                )
+                if finding:
+                    discovered.append(finding)
+            except ReviewCancelled:
+                raise
+            except Exception as exc:
+                failed_tasks.append(task)
+                message = str(exc)[:500] or type(exc).__name__
+                LOGGER.warning("独立规则任务失败 %s：%s", task, type(exc).__name__)
+                self.db.execute("UPDATE rule_evaluations SET status='调用失败',error=?,completed_at=? WHERE batch_id=? AND task_index=?",
+                                (message, utcnow(), batch_id, index))
+        if failed_tasks:
+            discovered.append(Finding(
+                "待人工确认", "Review", "部分独立规则未完成",
+                f"{len(failed_tasks)}/{len(tasks)} 条独立 LLM 任务调用失败。",
+                actual="；".join(failed_tasks), requirement="所有模板必检项目均应得到独立结论",
+                logic="单条失败不影响其他规则，失败任务需要重新审核或人工确认。",
+                suggestion="检查 LLM 服务后重新审核失败任务。", confidence=1.0,
+            ))
+        self._activity(batch_id, progress=94,
+                       activity=f"独立规则审核完成：{len(tasks)-len(failed_tasks)}/{len(tasks)} 条成功，新增 {len(discovered)} 个问题或待复核项",
+                       resource=_resource("LLM", settings.llm_base_url, settings.llm_model))
+        return _dedupe_findings([*findings, *discovered])
 
-    def _hybrid_basis_context(self, batch_id: str, basis_rows: list[dict[str, object]]) -> str:
-        """Combine exact FTS and vector hits, restricted to the basis selected for this batch."""
+    def _basis_context(self, batch_id: str, basis_rows: list[dict[str, object]]) -> str:
+        """Rank selected basis pages with local exact terms; no vector model is used."""
         ids = [row["id"] for row in self.db.query(
             """SELECT d.id FROM batch_documents bd JOIN documents d ON d.id=bd.document_id
                WHERE bd.batch_id=? AND bd.role IN ('selected_basis','supplemental_basis')""", (batch_id,)
@@ -445,30 +455,22 @@ class ReviewService:
         names = {row["id"]: row["original_name"] for row in self.db.query(
             f"SELECT id,original_name FROM documents WHERE id IN ({','.join('?' for _ in ids)})", ids
         )}
-        ranked: dict[tuple[str, int, str], float] = {}
         placeholders = ",".join("?" for _ in ids)
-        try:
-            lexical = self.db.query(
-                f"""SELECT document_id,page,content,bm25(document_fts) score FROM document_fts
-                    WHERE document_fts MATCH ? AND document_id IN ({placeholders}) ORDER BY score LIMIT 12""",
-                ["标准 OR 要求 OR specification OR requirement OR chemical OR mechanical", *ids],
-            )
-            for rank, row in enumerate(lexical, 1):
-                ranked[(row["document_id"], int(row["page"]), str(row["content"])[:2500])] = 1 / (60 + rank)
-        except Exception:
-            pass
-        try:
-            vector = DocumentVectorIndex(self.vector_root, self.config_store.get()).search(
-                ids, "材料牌号 炉号 化学成分 机械性能 尺寸 检验标准 合格要求", top_k=12
-            )
-            for rank, row in enumerate(vector, 1):
-                key = (row["document_id"], int(row["page"]), str(row["text"])[:2500])
-                ranked[key] = ranked.get(key, 0) + 1 / (60 + rank)
-        except Exception:
-            pass
+        pages = self.db.query(
+            f"SELECT document_id,page,content FROM document_fts WHERE document_id IN ({placeholders})", ids
+        )
+        terms = ("标准", "要求", "条款", "规格", "材料", "炉号", "化学", "机械", "尺寸", "检验",
+                 "standard", "requirement", "specification", "material", "chemical", "mechanical", "dimension", "inspection")
+        ranked = sorted(
+            pages,
+            key=lambda row: sum(str(row["content"]).casefold().count(term) for term in terms),
+            reverse=True,
+        )[:12]
         if ranked:
-            items = sorted(ranked, key=ranked.get, reverse=True)[:12]
-            return "\n\n".join(f"[依据={names.get(doc_id, doc_id)}][页={page}]\n{text}" for doc_id, page, text in items)
+            return "\n\n".join(
+                f"[依据={names.get(row['document_id'], row['document_id'])}][页={row['page']}]\n{str(row['content'])[:2500]}"
+                for row in ranked
+            )
         return "\n".join(f"[依据={row['original_name']}]\n{str(row['raw_text'])[:12000]}" for row in basis_rows)
 
     def _refresh_supplier_names_for_document(self, document_id: str) -> None:
@@ -603,6 +605,75 @@ def _join_names(names: Iterable[str]) -> str:
             seen.add(key)
             output.append(name)
     return " / ".join(output)
+
+
+def _uses_fastener_audit(template: dict[str, object]) -> bool:
+    """Recognize the established fastener template without depending on one exact display name."""
+    name = str(template.get("name") or "").casefold()
+    if "紧固件" in name or "CUSTOMER" in name:
+        return True
+    instructions = str(template.get("review_instructions") or "").casefold()
+    has_traceability = "wdc" in instructions or "coc" in instructions or "coi" in instructions or "mtr" in instructions
+    has_sampling = "sample" in instructions and "pass" in instructions
+    return has_traceability and has_sampling
+
+
+def _expert_document_chunks(documents: list[ExpertDocument], max_chars: int = 14_000) -> list[list[ExpertDocument]]:
+    """Split long reports by page so small-context local models can review every page."""
+    chunks: list[list[ExpertDocument]] = []
+    current: list[ExpertDocument] = []
+    current_chars = 0
+    for document in documents:
+        for page in document.pages:
+            text = page.text
+            segments = [text[offset:offset + max_chars] for offset in range(0, len(text), max_chars)] or [""]
+            for segment in segments:
+                size = len(document.filename) + len(segment) + 32
+                if current and current_chars + size > max_chars:
+                    chunks.append(current)
+                    current, current_chars = [], 0
+                current.append(ExpertDocument(document.filename, document.path, [PageText(page.page, segment)], document.ocr_status))
+                current_chars += size
+    if current:
+        chunks.append(current)
+    return chunks or [[]]
+
+
+def _rule_evidence_documents(
+    documents: list[ExpertDocument], task: str, max_chars: int = 14_000
+) -> list[ExpertDocument]:
+    """Build one compact, page-aware evidence package for one extensible template task."""
+    latin = set(re.findall(r"[a-z]+|\d+", task.casefold()))
+    chinese = {task[index:index + 2] for index in range(len(task) - 1)
+               if "\u3400" <= task[index] <= "\u9fff" and "\u3400" <= task[index + 1] <= "\u9fff"}
+    tokens = latin | chinese
+    markers = re.compile(
+        r"\[TABLE_ROW\]|supplier|manufacturer|report|certificate|standard|material|heat|batch|date|signature|stamp|"
+        r"sample|pass|result|chemical|mechanical|dimension|供应商|制造商|报告|证书|标准|材料|炉号|批次|日期|签字|盖章|结果|化学|机械|尺寸",
+        re.I,
+    )
+    output: list[ExpertDocument] = []
+    remaining = max_chars
+    for document in documents:
+        selected_pages: list[PageText] = []
+        for page in document.pages:
+            lines = [line.strip() for line in page.text.splitlines() if line.strip()]
+            relevant = [line for line in lines if markers.search(line) or any(token in line.casefold() for token in tokens)]
+            preview = "\n".join([*lines[:6], *relevant])
+            preview = "\n".join(dict.fromkeys(preview.splitlines()))[:1600]
+            if not preview:
+                preview = page.text[:400]
+            preview = preview[:remaining]
+            if preview:
+                selected_pages.append(PageText(page.page, preview))
+                remaining -= len(preview)
+            if remaining <= 0:
+                break
+        if selected_pages:
+            output.append(ExpertDocument(document.filename, document.path, selected_pages, document.ocr_status))
+        if remaining <= 0:
+            break
+    return output
 
 
 def _resource(kind: str, base_url: str, model: str) -> str:

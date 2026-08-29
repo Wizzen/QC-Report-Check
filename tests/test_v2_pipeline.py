@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from io import BytesIO
+import json
 from pathlib import Path
 from unittest.mock import patch
 
@@ -8,10 +9,11 @@ import pymupdf
 import pytest
 from docx import Document
 
-from app.auditing.v2_service import ReviewService
+from app.auditing.v2_service import ReviewService, _expert_document_chunks
+from app.auditing.expert_review import ExpertDocument, build_expert_prompt
 from app.database import ReviewDatabase
 from app.integrations import ConfigStore
-from app.models import Finding
+from app.models import Finding, PageText
 
 
 class NamedBytesIO(BytesIO):
@@ -55,7 +57,7 @@ def test_review_requires_supplier_file_before_creating_batch(tmp_path: Path) -> 
 def test_full_local_rule_path_uses_basis_not_supplier_archive(tmp_path: Path) -> None:
     service = _service(tmp_path)
     basis = NamedBytesIO("抗拉强度 >= 500 MPa".encode("utf-8"), "采购技术要求.txt")
-    with patch("app.auditing.v2_service.DocumentVectorIndex.index", return_value=(0, "embedding_failed")):
+    with patch("app.integrations.clients.EmbeddingClient.embed") as embed:
         basis_id = service.import_basis(basis, "technical")
         supplier = _docx(
             "Material Test Certificate  Supplier Quality Record  "
@@ -65,6 +67,7 @@ def test_full_local_rule_path_uses_basis_not_supplier_archive(tmp_path: Path) ->
         )
         batch_id = service.create_review(None, [basis_id], [supplier], [])
         service.process_batch(batch_id)
+    embed.assert_not_called()
 
     batch = service.db.one("SELECT * FROM review_batches WHERE id=?", (batch_id,))
     findings = service.db.query("SELECT * FROM findings WHERE batch_id=?", (batch_id,))
@@ -76,6 +79,7 @@ def test_full_local_rule_path_uses_basis_not_supplier_archive(tmp_path: Path) ->
         (batch_id,),
     )
     assert selected_basis and {row["library_code"] for row in selected_basis} == {"basis"}
+    assert service.db.one("SELECT index_status FROM documents WHERE id=?", (basis_id,))["index_status"] == "not_used"
 
 
 def test_llm_explanations_are_batched_instead_of_one_call_per_finding(tmp_path: Path) -> None:
@@ -98,3 +102,149 @@ def test_llm_explanations_are_batched_instead_of_one_call_per_finding(tmp_path: 
     assert "批量解释" in batch["activity"]
     assert "LLM" in batch["resource"]
     assert batch["heartbeat_at"]
+
+
+def test_fastener_template_alias_keeps_proven_report_checks(tmp_path: Path) -> None:
+    """Regression: the user's existing template name must not disable fastener checks."""
+    service = _service(tmp_path)
+    template_id = service.db.execute(
+        """INSERT INTO audit_templates(name,description,required_document_types,required_items,review_instructions,
+           enabled,is_default,created_at) VALUES(?,?,?,?,?,1,0,datetime('now'))""",
+        ("紧固件质量文件审核", "", "[]", "[]", "核验 WDC、COC/MTR 以及 Sample/Pass 表格"),
+    )
+    batch_id = service.db.create_batch(template_id)
+    document_id = service.db.add_document(
+        library="supplier", kind="supplier", original_name="Q0045 5305-859240(MTR).pdf",
+        stored_path=str(tmp_path / "same-report.pdf"), sha256="same-report",
+    )
+    page_text = """QUALITY CERTIFICATE
+CHEMICAL COMPOSITION(%)
+Mechanical Properties
+Dimensions Of SPEC
+[TABLE_ROW] Head Height || 10.18-9.82 || 9.91-10.00 || 20 || 19
+[TABLE_ROW] Thread Length || min 38. || 40.00-40.00 || 20 || 17
+[TABLE_ROW] HV(2)>=HV(1)-30 || G 0.015max || 6 || 6
+"""
+    service.db.execute(
+        "UPDATE documents SET page_text=?,parse_status='completed' WHERE id=?",
+        (json.dumps([{"page": 1, "text": page_text}], ensure_ascii=False), document_id),
+    )
+    service.db.attach_document(batch_id, document_id, "supplier", 4)
+
+    findings = service._audit(batch_id)
+
+    assert any(item.item == "Head Height" and item.severity == "Major" for item in findings)
+    assert any(item.item == "Thread Length" and item.severity == "Major" for item in findings)
+
+
+def test_llm_failure_never_claims_zero_problems(tmp_path: Path) -> None:
+    service = _service(tmp_path)
+    service.config_store.save({"llm_model": "test-model"})
+    template_id = service.db.execute(
+        """INSERT INTO audit_templates(name,description,required_document_types,required_items,review_instructions,
+           enabled,is_default,created_at) VALUES(?,?,?,?,?,1,0,datetime('now'))""",
+        ("失败隔离模板", "", "[]", json.dumps(["检查报告编号"], ensure_ascii=False), "只依据原文"),
+    )
+    batch_id = service.db.create_batch(template_id)
+    document_id = service.db.add_document(
+        library="supplier", kind="supplier", original_name="unknown.pdf",
+        stored_path=str(tmp_path / "unknown.pdf"), sha256="unknown",
+    )
+    service.db.execute(
+        "UPDATE documents SET page_text=?,parse_status='completed' WHERE id=?",
+        (json.dumps([{"page": 1, "text": "Readable supplier inspection report with no deterministic mismatch."}]), document_id),
+    )
+    service.db.attach_document(batch_id, document_id, "supplier", 4)
+
+    with patch("app.auditing.v2_service.LLMClient.generate_json", side_effect=RuntimeError("offline")):
+        findings = service._expert_review(batch_id, [])
+
+    assert len(findings) == 1
+    assert findings[0].severity == "Review"
+    assert findings[0].item == "部分独立规则未完成"
+
+
+def test_each_template_item_calls_llm_once_and_is_aggregated(tmp_path: Path) -> None:
+    service = _service(tmp_path)
+    service.config_store.save({"llm_model": "test-model"})
+    tasks = ["检查炉号", "检查客户签字", "检查报告编号"]
+    template_id = service.db.execute(
+        """INSERT INTO audit_templates(name,description,required_document_types,required_items,review_instructions,
+           enabled,is_default,created_at) VALUES(?,?,?,?,?,1,0,datetime('now'))""",
+        ("逐条模板", "", "[]", json.dumps(tasks, ensure_ascii=False), "只依据原文"),
+    )
+    batch_id = service.db.create_batch(template_id)
+    document_id = service.db.add_document(
+        library="supplier", kind="supplier", original_name="MTR.pdf",
+        stored_path=str(tmp_path / "MTR.pdf"), sha256="independent-rules",
+    )
+    service.db.execute(
+        "UPDATE documents SET page_text=?,parse_status='completed' WHERE id=?",
+        (json.dumps([{"page": 1, "text": "Heat No: H123\nReport No: R456"}], ensure_ascii=False), document_id),
+    )
+    service.db.attach_document(batch_id, document_id, "supplier", 4)
+    responses = [
+        {"result": "合格", "conclusion": "炉号存在", "source_file": "MTR.pdf", "page": 1,
+         "evidence": "Heat No: H123", "confidence": 0.95},
+        {"result": "不适用", "conclusion": "本报告无需客户签字", "confidence": 0.9},
+        {"result": "存疑", "conclusion": "报告编号需复核", "source_file": "MTR.pdf", "page": 1,
+         "evidence": "Report No: R456", "logic": "格式不明确", "confidence": 0.72},
+    ]
+
+    with patch("app.auditing.v2_service.LLMClient.generate_json", side_effect=responses) as generate:
+        findings = service._expert_review(batch_id, [])
+
+    assert generate.call_count == len(tasks)
+    evaluations = service.db.query(
+        "SELECT task_name,status FROM rule_evaluations WHERE batch_id=? ORDER BY task_index", (batch_id,)
+    )
+    assert [(row["task_name"], row["status"]) for row in evaluations] == [
+        (tasks[0], "合格"), (tasks[1], "不适用"), (tasks[2], "存疑")]
+    assert [finding.item for finding in findings] == ["检查报告编号"]
+
+
+def test_one_failed_rule_does_not_stop_later_rules(tmp_path: Path) -> None:
+    service = _service(tmp_path)
+    service.config_store.save({"llm_model": "test-model"})
+    tasks = ["任务一", "任务二", "任务三"]
+    template_id = service.db.execute(
+        """INSERT INTO audit_templates(name,description,required_document_types,required_items,review_instructions,
+           enabled,is_default,created_at) VALUES(?,?,?,?,?,1,0,datetime('now'))""",
+        ("失败隔离", "", "[]", json.dumps(tasks, ensure_ascii=False), "只依据原文"),
+    )
+    batch_id = service.db.create_batch(template_id)
+    document_id = service.db.add_document(
+        library="supplier", kind="supplier", original_name="MTR.pdf",
+        stored_path=str(tmp_path / "MTR.pdf"), sha256="failure-isolation",
+    )
+    service.db.execute(
+        "UPDATE documents SET page_text=?,parse_status='completed' WHERE id=?",
+        (json.dumps([{"page": 1, "text": "Inspection Report"}], ensure_ascii=False), document_id),
+    )
+    service.db.attach_document(batch_id, document_id, "supplier", 4)
+    responses = [
+        {"result": "合格", "conclusion": "完成"}, RuntimeError("temporary offline"),
+        {"result": "不适用", "conclusion": "完成"},
+    ]
+
+    with patch("app.auditing.v2_service.LLMClient.generate_json", side_effect=responses) as generate:
+        findings = service._expert_review(batch_id, [])
+
+    assert generate.call_count == 3
+    assert [row["status"] for row in service.db.query(
+        "SELECT status FROM rule_evaluations WHERE batch_id=? ORDER BY task_index", (batch_id,))] == [
+            "合格", "调用失败", "不适用"]
+    assert any(finding.item == "部分独立规则未完成" for finding in findings)
+
+
+def test_long_report_is_split_for_small_context_models(tmp_path: Path) -> None:
+    document = ExpertDocument(
+        "long-report.pdf", tmp_path / "long-report.pdf",
+        [PageText(page, f"page-{page} " + ("inspection evidence " * 700)) for page in range(1, 5)],
+    )
+
+    chunks = _expert_document_chunks([document])
+
+    assert len(chunks) >= 4
+    assert {page.page for chunk in chunks for item in chunk for page in item.pages} == {1, 2, 3, 4}
+    assert all(len(build_expert_prompt(chunk, "", [])) < 24_000 for chunk in chunks)

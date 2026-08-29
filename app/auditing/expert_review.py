@@ -80,7 +80,9 @@ def build_expert_prompt(
     documents: list[ExpertDocument], instructions: str, existing: Iterable[Finding], basis: str = ""
 ) -> str:
     document_blocks: list[str] = []
-    remaining = 48_000
+    # The service chunks long reports before calling this builder. Keep a hard
+    # guard here as well for local models with an 8K context window.
+    remaining = 16_000
     for document in documents:
         page_blocks: list[str] = []
         for page in document.pages:
@@ -106,7 +108,7 @@ def build_expert_prompt(
 {instructions or FASTENER_FALLBACK_INSTRUCTIONS}
 
 所选审核依据（为空表示没有额外标准，不得自行补充标准值）：
-{basis[:12_000] or "未提供额外标准"}
+{basis[:6_000] or "未提供额外标准"}
 
 确定性规则已发现的问题（不要重复）：
 {json.dumps(known, ensure_ascii=False)}
@@ -122,6 +124,95 @@ def build_expert_prompt(
 5. 同时识别每份文件的供应商、制造商、材料生产厂或报告出具机构；排除 Customer、Buyer、Purchaser 等采购方。名称必须逐字存在于该文件原文。
 6. 只返回 JSON：{{"documents":[{{"source_file":"报告.pdf","supplier_names":["供应商 A","材料厂 B"]}}],"findings":[{{"check_id":"C5","result":"不合格","category":"检测结果不合格","item":"Head Height","description":"...","source_file":"...","page":1,"evidence":"[TABLE_ROW] ...","actual":"...","requirement":"...","logic":"...","suggestion":"...","confidence":0.95}}]}}
 """
+
+
+def build_rule_task_prompt(
+    task: str, documents: list[ExpertDocument], instructions: str, existing: Iterable[Finding], basis: str = ""
+) -> str:
+    evidence_blocks = []
+    remaining = 16_000
+    for document in documents:
+        for page in document.pages:
+            block = f"[文件={document.filename}][页={page.page}]\n{page.text.strip()}"
+            block = block[:remaining]
+            if block:
+                evidence_blocks.append(block)
+                remaining -= len(block)
+            if remaining <= 0:
+                break
+        if remaining <= 0:
+            break
+    known = [{"item": item.item, "result": item.severity, "evidence": item.source_text or item.actual} for item in existing]
+    return f"""你是受证据约束的供应商质量文件审核专家。本次只执行一个独立审核任务，不得顺带判断其他任务。
+
+当前审核任务：{task}
+
+通用审核边界：
+{instructions or FASTENER_FALLBACK_INSTRUCTIONS}
+
+所选审核依据：
+{basis[:6_000] or "未提供额外标准，不得自行补充标准值"}
+
+本地规则已发现内容（仅用于避免矛盾）：
+{json.dumps(known, ensure_ascii=False)}
+
+本批次文件清单：{json.dumps([item.filename for item in documents], ensure_ascii=False)}
+
+逐页证据：
+{chr(10).join(evidence_blocks)}
+
+判断要求：
+1. result 只能是“合格”“不合格”“存疑”“不适用”。
+2. 不合格或存疑必须给出逐字存在于对应原页的 evidence；若判断的是文件/字段完全缺失，可使用 evidence_type="absence" 并在 checked_scope 写明检查过的文件和页面。
+3. 不得引用输入之外的标准，不得编造页码、数值或证据。
+4. 只返回一个 JSON 对象：
+{{"task":"{task}","result":"合格|不合格|存疑|不适用","conclusion":"...","source_file":"...","page":1,"evidence":"...","evidence_type":"source|absence","checked_scope":"...","actual":"...","requirement":"...","logic":"...","suggestion":"...","confidence":0.0}}
+"""
+
+
+def rule_evaluation_from_llm(
+    payload: dict[str, object], task: str, documents: list[ExpertDocument]
+) -> tuple[dict[str, object], Finding | None]:
+    result = str(payload.get("result") or "").strip()
+    if result not in {"合格", "不合格", "存疑", "不适用"}:
+        raise ValueError("独立规则结果必须是合格、不合格、存疑或不适用")
+    filename = str(payload.get("source_file") or "").strip()
+    try:
+        page = int(payload.get("page") or 0)
+    except (TypeError, ValueError):
+        page = 0
+    evidence = str(payload.get("evidence") or "").strip()
+    evidence_type = str(payload.get("evidence_type") or "source").strip()
+    checked_scope = str(payload.get("checked_scope") or "").strip()
+    page_lookup = {(document.filename, item.page): item.text for document in documents for item in document.pages}
+    if result in {"不合格", "存疑"}:
+        if evidence_type == "absence":
+            if not checked_scope:
+                raise ValueError("缺失类结论必须提供检查范围")
+            evidence = checked_scope
+            if not filename and documents:
+                filename = documents[0].filename
+            page = page or 1
+        elif not filename or page <= 0 or not evidence or not _evidence_present(evidence, page_lookup.get((filename, page), "")):
+            raise ValueError("不合格或存疑结论缺少可核验的原页证据")
+    confidence = _confidence(payload.get("confidence"))
+    evaluation = {
+        "task_name": task, "status": result, "conclusion": str(payload.get("conclusion") or ""),
+        "source_file": filename, "source_page": page, "evidence": evidence, "evidence_type": evidence_type,
+        "actual": str(payload.get("actual") or ""), "requirement": str(payload.get("requirement") or ""),
+        "logic": str(payload.get("logic") or ""), "suggestion": str(payload.get("suggestion") or ""),
+        "confidence": confidence,
+    }
+    if result not in {"不合格", "存疑"}:
+        return evaluation, None
+    finding = Finding(
+        "独立规则复核", "Major" if result == "不合格" else "Review", task,
+        str(payload.get("conclusion") or f"独立规则判断为{result}"),
+        evaluation["actual"], evaluation["requirement"], filename, page or 1, evidence,
+        logic=evaluation["logic"], suggestion=evaluation["suggestion"] or "请人工复核并要求供应商补充证据。",
+        confidence=confidence, metadata={"origin": "llm_rule_task", "result": result, "evidence_type": evidence_type},
+    )
+    return evaluation, finding
 
 
 FASTENER_FALLBACK_INSTRUCTIONS = "检查文件完整性、可读性、追溯字段一致性，以及文件中明确标准与实测结果的一致性。"

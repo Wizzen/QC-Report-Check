@@ -28,6 +28,12 @@ GLOBAL_CSS = """
 .qaqc-evidence {border:1px solid #e5e7eb; border-radius:.9rem; padding:1rem; background:#fafafa; min-height:180px;}
 .qaqc-evidence .meta {font-size:.78rem; color:#667085; margin-bottom:.75rem;}
 .qaqc-evidence pre {white-space:pre-wrap; word-break:break-word; font-size:.84rem; margin:0; font-family:ui-monospace,SFMono-Regular,Consolas,monospace;}
+.st-key-dashboard_all button,.st-key-dashboard_completed button,.st-key-dashboard_processing button,
+.st-key-dashboard_issues button,.st-key-dashboard_major button,.st-key-dashboard_review button {
+  min-height:5rem; border-radius:.9rem; font-size:1rem; font-weight:700;
+}
+.st-key-dashboard_all button p,.st-key-dashboard_completed button p,.st-key-dashboard_processing button p,
+.st-key-dashboard_issues button p,.st-key-dashboard_major button p,.st-key-dashboard_review button p {line-height:1.2;}
 @media (max-width: 700px) {
   .stMainBlockContainer {padding:3rem 1rem 4rem;}
   .qaqc-hero {margin:.7rem auto 1.4rem;}

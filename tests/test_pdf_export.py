@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import hashlib
+from io import BytesIO
 from pathlib import Path
 
 import pymupdf
+from openpyxl import load_workbook
 
 from app.database import ReviewDatabase
 from app.database.v2 import utcnow
-from app.exporters import export_batch_pdf
+from app.exporters import export_batch, export_batch_pdf
 
 
 def test_pdf_report_contains_summary_details_and_only_matched_screenshot(tmp_path: Path) -> None:
@@ -29,6 +31,12 @@ def test_pdf_report_contains_summary_details_and_only_matched_screenshot(tmp_pat
     db.execute("UPDATE documents SET supplier_name=?,page_count=1,parse_status='completed',ocr_status='not_needed' WHERE id=?",
                ("ACME FASTENERS CO.,LTD", document_id))
     db.attach_document(batch_id, document_id, "supplier", 4)
+    db.execute(
+        """INSERT INTO rule_evaluations(batch_id,task_index,task_name,status,conclusion,source_file,source_page,
+           evidence,confidence,completed_at) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+        (batch_id, 1, "检查尺寸实测值", "不合格", "Head Height 通过数不足", "supplier.pdf", 1,
+         "Head Height", 0.96, utcnow()),
+    )
     for item, evidence in (("Head Height", "Head Height"), ("Missing COC", "batch file list only")):
         db.execute(
             """INSERT INTO findings(batch_id,category,severity,item,description,actual,requirement,source_file,
@@ -44,6 +52,11 @@ def test_pdf_report_contains_summary_details_and_only_matched_screenshot(tmp_pat
     text = "\n".join(page.get_text() for page in report)
     assert "SUPPLIER QUALITY REVIEW" in text
     assert "ACME FASTENERS CO.,LTD" in text
+    assert "逐条规则审核汇总" in text and "检查尺寸实测值" in text
     assert "Head Height" in text and "Missing COC" in text
     assert sum(len(page.get_images(full=True)) for page in report) == 1
     report.close()
+
+    workbook = load_workbook(BytesIO(export_batch(db, batch_id)), read_only=True)
+    assert workbook.sheetnames == ["问题清单", "审核汇总", "逐条规则", "审核依据"]
+    assert workbook["逐条规则"]["B2"].value == "检查尺寸实测值"

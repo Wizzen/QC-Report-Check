@@ -59,10 +59,14 @@ def export_batch(db: ReviewDatabase, batch_id: str) -> bytes:
         """SELECT d.*,bd.role,bd.priority FROM batch_documents bd JOIN documents d ON d.id=bd.document_id
            WHERE bd.batch_id=? ORDER BY bd.priority,d.created_at""", (batch_id,)
     )
+    rule_evaluations = db.query(
+        """SELECT task_index,task_name,status,conclusion,source_file,source_page,evidence,evidence_type,
+                  actual,requirement,logic,suggestion,confidence,error,started_at,completed_at
+           FROM rule_evaluations WHERE batch_id=? ORDER BY task_index""", (batch_id,)
+    )
     rows = [{
         "序号": index, "审核批次": batch["name"], "审核模板": batch.get("template_name") or "",
-        "供应商": batch.get("supplier_name") or "", "规则编号": finding.get("rule_code") or "",
-        "规则版本": finding.get("rule_version") or 1, "文档类型": finding.get("document_type") or "",
+        "供应商": batch.get("supplier_name") or "",
         "问题等级": finding["severity"], "问题类别": finding["category"], "文件名称": finding["source_file"],
         "页码": finding["source_page"], "检查项目": finding["item"], "实际内容": finding["actual"],
         "要求内容": finding["requirement"], "对应标准": finding["standard_file"],
@@ -72,20 +76,31 @@ def export_batch(db: ReviewDatabase, batch_id: str) -> bytes:
     } for index, finding in enumerate(findings, start=1)]
     levels = ("Critical", "Major", "Minor", "Warning", "Review")
     summary = [{"指标": "审核批次", "内容": batch["name"]}, {"指标": "供应商", "内容": batch.get("supplier_name") or "未识别"},
-               {"指标": "模板与规则版本", "内容": f"{batch.get('template_name') or '-'} / v{batch.get('rule_version') or 1}"},
+               {"指标": "审核模板", "内容": batch.get("template_name") or "-"},
                {"指标": "文件数量", "内容": len(documents)},
                {"指标": "问题数量", "内容": len(findings)},
                *({"指标": level, "内容": sum(item["severity"] == level for item in findings)} for level in levels)]
     basis = [{"文件名称": item["original_name"], "类别": item["document_kind"], "角色": item["role"],
               "优先级": item["priority"], "页数": item["page_count"], "解析状态": item["parse_status"],
-              "索引状态": item["index_status"]} for item in documents if item["role"] != "supplier"]
+              "依据检索": "本地关键词"} for item in documents if item["role"] != "supplier"]
+    rule_rows = [{
+        "序号": item["task_index"], "审核任务": item["task_name"], "结论": item["status"],
+        "结论说明": item["conclusion"], "证据文件": item["source_file"], "页码": item["source_page"],
+        "证据": item["evidence"], "证据类型": item["evidence_type"], "实际值": item["actual"],
+        "要求值": item["requirement"], "判断逻辑": item["logic"], "整改建议": item["suggestion"],
+        "置信度": item["confidence"], "调用错误": item["error"], "开始时间": item["started_at"],
+        "完成时间": item["completed_at"],
+    } for item in rule_evaluations]
     output = BytesIO()
-    columns = ["序号", "审核批次", "审核模板", "供应商", "规则编号", "规则版本", "文档类型", "问题等级", "问题类别", "文件名称", "页码", "检查项目", "实际内容",
+    columns = ["序号", "审核批次", "审核模板", "供应商", "问题等级", "问题类别", "文件名称", "页码", "检查项目", "实际内容",
                "要求内容", "对应标准", "标准页码", "标准条款", "判断逻辑", "问题描述", "整改建议", "AI置信度", "人工状态", "备注"]
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         pd.DataFrame(rows, columns=columns).to_excel(writer, sheet_name="问题清单", index=False)
         pd.DataFrame(summary).to_excel(writer, sheet_name="审核汇总", index=False)
-        pd.DataFrame(basis, columns=["文件名称", "类别", "角色", "优先级", "页数", "解析状态", "索引状态"]).to_excel(writer, sheet_name="审核依据", index=False)
+        pd.DataFrame(rule_rows, columns=["序号", "审核任务", "结论", "结论说明", "证据文件", "页码", "证据", "证据类型",
+            "实际值", "要求值", "判断逻辑", "整改建议", "置信度", "调用错误", "开始时间", "完成时间"]).to_excel(
+                writer, sheet_name="逐条规则", index=False)
+        pd.DataFrame(basis, columns=["文件名称", "类别", "角色", "优先级", "页数", "解析状态", "依据检索"]).to_excel(writer, sheet_name="审核依据", index=False)
         for sheet in writer.book.worksheets:
             sheet.freeze_panes = "A2"; sheet.auto_filter.ref = sheet.dimensions
             for cell in sheet[1]:

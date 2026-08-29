@@ -66,11 +66,15 @@ def export_batch_pdf(db: ReviewDatabase, batch_id: str) -> bytes:
            WHERE bd.batch_id=? ORDER BY bd.priority,d.created_at""",
         (batch_id,),
     )
-    return _build_report(batch, findings, documents)
+    rule_evaluations = db.query(
+        "SELECT task_index,task_name,status,conclusion,error FROM rule_evaluations WHERE batch_id=? ORDER BY task_index",
+        (batch_id,),
+    )
+    return _build_report(batch, findings, documents, rule_evaluations)
 
 
 def _build_report(batch: dict[str, object], findings: list[dict[str, object]],
-                  documents: list[dict[str, object]]) -> bytes:
+                  documents: list[dict[str, object]], rule_evaluations: list[dict[str, object]] | None = None) -> bytes:
     _register_fonts()
     styles = _styles()
     output = BytesIO()
@@ -86,6 +90,9 @@ def _build_report(batch: dict[str, object], findings: list[dict[str, object]],
               for level in ("Critical", "Major", "Minor", "Warning", "Review")}
 
     story.extend(_cover(batch, findings, supplier_docs, basis_docs, counts, styles))
+    if rule_evaluations:
+        story.append(PageBreak())
+        story.extend(_rule_summary(rule_evaluations, styles))
     story.append(PageBreak())
     story.extend(_detail_intro(findings, styles))
     file_lookup = {str(item["original_name"]): item for item in supplier_docs}
@@ -100,6 +107,38 @@ def _build_report(batch: dict[str, object], findings: list[dict[str, object]],
 
     document.build(story, onFirstPage=_first_page, onLaterPages=_later_pages)
     return output.getvalue()
+
+
+def _rule_summary(rows: list[dict[str, object]], styles: dict[str, ParagraphStyle]) -> list[object]:
+    counts = {status: sum(str(row.get("status")) == status for row in rows)
+              for status in ("合格", "不合格", "存疑", "不适用", "调用失败")}
+    table_rows = [[Paragraph("序号", styles["table_head"]), Paragraph("独立审核任务", styles["table_head"]),
+                   Paragraph("结论", styles["table_head"]), Paragraph("说明", styles["table_head"])]]
+    for row in rows:
+        explanation = str(row.get("conclusion") or row.get("error") or "-")
+        table_rows.append([
+            Paragraph(str(row.get("task_index") or "-"), styles["table_cell"]),
+            Paragraph(_safe(str(row.get("task_name") or "-")), styles["table_cell"]),
+            Paragraph(_safe(str(row.get("status") or "-")), styles["table_cell"]),
+            Paragraph(_safe(explanation[:600]), styles["table_cell"]),
+        ])
+    return [
+        Paragraph("逐条规则审核汇总", styles["page_title"]), Spacer(1, 2 * mm),
+        Paragraph(
+            f"模板共执行 {len(rows)} 个相互独立的 LLM 审核任务：合格 {counts['合格']}，不合格 {counts['不合格']}，"
+            f"存疑 {counts['存疑']}，不适用 {counts['不适用']}，调用失败 {counts['调用失败']}。",
+            styles["body"],
+        ), Spacer(1, 6 * mm),
+        Table(table_rows, colWidths=[14 * mm, 62 * mm, 22 * mm, 59 * mm], repeatRows=1,
+              style=TableStyle([("BACKGROUND", (0, 0), (-1, 0), NAVY),
+                                ("BOX", (0, 0), (-1, -1), 0.6, LINE),
+                                ("INNERGRID", (0, 0), (-1, -1), 0.35, LINE),
+                                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                                ("LEFTPADDING", (0, 0), (-1, -1), 6),
+                                ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+                                ("TOPPADDING", (0, 0), (-1, -1), 5),
+                                ("BOTTOMPADDING", (0, 0), (-1, -1), 5)])),
+    ]
 
 
 def _cover(batch: dict[str, object], findings: list[dict[str, object]],
@@ -207,8 +246,6 @@ def _finding_detail(index: int, finding: dict[str, object], file_lookup: dict[st
     metadata = Table([
         [Paragraph("类别", styles["meta_label"]), Paragraph(_safe(str(finding.get("category") or "-")), styles["meta_value"]),
          Paragraph("人工状态", styles["meta_label"]), Paragraph(_safe(str(finding.get("status") or "-")), styles["meta_value"])],
-        [Paragraph("规则", styles["meta_label"]), Paragraph(_safe(f"{finding.get('rule_code') or '历史规则'} / v{finding.get('rule_version') or 1}"), styles["meta_value"]),
-         Paragraph("文档类型", styles["meta_label"]), Paragraph(_safe(str(finding.get("document_type") or "-")), styles["meta_value"])],
         [Paragraph("供应商文件", styles["meta_label"]), Paragraph(_safe(str(finding.get("source_file") or "-")), styles["meta_value"]),
          Paragraph("原页", styles["meta_label"]), Paragraph(str(finding.get("source_page") or 1), styles["meta_value"])],
         [Paragraph("审核依据", styles["meta_label"]), Paragraph(_safe(str(finding.get("standard_file") or "模板内置规则")), styles["meta_value"]),

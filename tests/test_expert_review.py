@@ -1,10 +1,13 @@
 from pathlib import Path
 
+import pytest
+
 from app.auditing.expert_review import (
     ExpertDocument,
     deterministic_fastener_audit,
     extract_supplier_names,
     findings_from_llm,
+    rule_evaluation_from_llm,
     supplier_names_from_llm,
 )
 from app.extractors import extract_filename_items
@@ -44,6 +47,42 @@ def test_llm_findings_require_exact_page_evidence() -> None:
     findings = findings_from_llm(payload, [document])
 
     assert [item.item for item in findings] == ["Head Height"]
+
+
+def test_independent_rule_accepts_pass_without_creating_a_finding() -> None:
+    document = ExpertDocument("MTR.pdf", Path("sample.pdf"), [PageText(1, "Heat No: H123")])
+
+    evaluation, finding = rule_evaluation_from_llm(
+        {"result": "合格", "conclusion": "炉号存在", "source_file": "MTR.pdf", "page": 1,
+         "evidence": "Heat No: H123", "confidence": 0.94},
+        "检查炉号是否存在", [document],
+    )
+
+    assert evaluation["status"] == "合格"
+    assert finding is None
+
+
+def test_independent_rule_rejects_fabricated_problem_evidence() -> None:
+    document = ExpertDocument("MTR.pdf", Path("sample.pdf"), [PageText(1, "Heat No: H123")])
+
+    with pytest.raises(ValueError, match="可核验"):
+        rule_evaluation_from_llm(
+            {"result": "不合格", "source_file": "MTR.pdf", "page": 1, "evidence": "Heat No: FAKE"},
+            "检查炉号是否一致", [document],
+        )
+
+
+def test_independent_rule_accepts_missing_field_with_checked_scope() -> None:
+    document = ExpertDocument("MTR.pdf", Path("sample.pdf"), [PageText(1, "Inspection Report")])
+
+    evaluation, finding = rule_evaluation_from_llm(
+        {"result": "存疑", "conclusion": "未找到报告编号", "evidence_type": "absence",
+         "checked_scope": "已检查 MTR.pdf 第1页", "confidence": 0.8},
+        "检查报告编号", [document],
+    )
+
+    assert evaluation["evidence"] == "已检查 MTR.pdf 第1页"
+    assert finding and finding.severity == "Review"
 
 
 def test_wdc_is_recovered_from_filename() -> None:

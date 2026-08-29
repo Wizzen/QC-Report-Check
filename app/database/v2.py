@@ -123,22 +123,6 @@ CREATE TABLE IF NOT EXISTS jobs (
   created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
   FOREIGN KEY(batch_id) REFERENCES review_batches(id) ON DELETE CASCADE
 );
-CREATE TABLE IF NOT EXISTS audit_rules (
-  code TEXT PRIMARY KEY, group_name TEXT NOT NULL, title TEXT NOT NULL,
-  applies_to TEXT NOT NULL DEFAULT '[]', severity TEXT NOT NULL DEFAULT 'Review',
-  evaluator TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, current_version INTEGER NOT NULL DEFAULT 1
-);
-CREATE TABLE IF NOT EXISTS audit_rule_versions (
-  rule_code TEXT NOT NULL, version INTEGER NOT NULL, parameters TEXT NOT NULL DEFAULT '{}',
-  change_reason TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
-  PRIMARY KEY(rule_code,version), FOREIGN KEY(rule_code) REFERENCES audit_rules(code) ON DELETE CASCADE
-);
-CREATE TABLE IF NOT EXISTS template_rule_versions (
-  template_id INTEGER NOT NULL, rule_code TEXT NOT NULL, rule_version INTEGER NOT NULL,
-  enabled INTEGER NOT NULL DEFAULT 1, PRIMARY KEY(template_id,rule_code),
-  FOREIGN KEY(template_id) REFERENCES audit_templates(id) ON DELETE CASCADE,
-  FOREIGN KEY(rule_code,rule_version) REFERENCES audit_rule_versions(rule_code,version)
-);
 CREATE TABLE IF NOT EXISTS document_fields (
   id INTEGER PRIMARY KEY AUTOINCREMENT, document_id TEXT NOT NULL, field_key TEXT NOT NULL,
   raw_value TEXT NOT NULL DEFAULT '', normalized_value TEXT NOT NULL DEFAULT '', unit TEXT NOT NULL DEFAULT '',
@@ -167,7 +151,6 @@ CREATE TABLE IF NOT EXISTS finding_evidence (
 CREATE TABLE IF NOT EXISTS review_feedback (
   id INTEGER PRIMARY KEY AUTOINCREMENT, finding_id INTEGER NOT NULL, batch_id TEXT NOT NULL,
   action TEXT NOT NULL, correction TEXT NOT NULL DEFAULT '', evidence TEXT NOT NULL DEFAULT '', note TEXT NOT NULL DEFAULT '',
-  rule_code TEXT NOT NULL DEFAULT '', rule_version INTEGER NOT NULL DEFAULT 1,
   service_fingerprint TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
   FOREIGN KEY(finding_id) REFERENCES findings(id) ON DELETE CASCADE,
   FOREIGN KEY(batch_id) REFERENCES review_batches(id) ON DELETE CASCADE
@@ -176,6 +159,16 @@ CREATE TABLE IF NOT EXISTS job_events (
   id INTEGER PRIMARY KEY AUTOINCREMENT, batch_id TEXT NOT NULL, stage TEXT NOT NULL,
   activity TEXT NOT NULL, resource TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
   FOREIGN KEY(batch_id) REFERENCES review_batches(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS rule_evaluations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, batch_id TEXT NOT NULL, task_index INTEGER NOT NULL,
+  task_name TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', conclusion TEXT NOT NULL DEFAULT '',
+  source_file TEXT NOT NULL DEFAULT '', source_page INTEGER NOT NULL DEFAULT 0,
+  evidence TEXT NOT NULL DEFAULT '', evidence_type TEXT NOT NULL DEFAULT 'source',
+  actual TEXT NOT NULL DEFAULT '', requirement TEXT NOT NULL DEFAULT '', logic TEXT NOT NULL DEFAULT '',
+  suggestion TEXT NOT NULL DEFAULT '', confidence REAL NOT NULL DEFAULT 0, error TEXT NOT NULL DEFAULT '',
+  started_at TEXT NOT NULL DEFAULT '', completed_at TEXT NOT NULL DEFAULT '',
+  UNIQUE(batch_id,task_index), FOREIGN KEY(batch_id) REFERENCES review_batches(id) ON DELETE CASCADE
 );
 CREATE VIRTUAL TABLE IF NOT EXISTS document_fts USING fts5(document_id UNINDEXED,page UNINDEXED,content,tokenize='unicode61');
 """
@@ -220,6 +213,13 @@ class ReviewDatabase:
         now = utcnow()
         with self.connect() as connection:
             connection.executescript(SCHEMA_V2)
+            # v0.4.0 briefly introduced a generic versioned-rule subsystem. It was
+            # withdrawn because it suppressed the proven template-specific audit.
+            connection.executescript("""
+                DROP TABLE IF EXISTS template_rule_versions;
+                DROP TABLE IF EXISTS audit_rule_versions;
+                DROP TABLE IF EXISTS audit_rules;
+            """)
             columns = {row[1] for row in connection.execute("PRAGMA table_info(review_batches)").fetchall()}
             for name, declaration in {
                 "supplier_name": "TEXT NOT NULL DEFAULT ''",
@@ -291,16 +291,9 @@ class ReviewDatabase:
         batch_id = str(uuid.uuid4())
         now = utcnow()
         name = f"审核批次 {datetime.now().strftime('%Y-%m-%d %H:%M')}"
-        template = self.one("SELECT * FROM audit_templates WHERE id=?", (template_id,)) if template_id else None
-        rules = self.query(
-            """SELECT tr.rule_code,tr.rule_version,tr.enabled,r.title,r.group_name FROM template_rule_versions tr
-               JOIN audit_rules r ON r.code=tr.rule_code WHERE tr.template_id=? ORDER BY tr.rule_code""", (template_id,)
-        ) if template_id else []
-        rule_version = max([int(row["rule_version"]) for row in rules] or [1])
-        snapshot = json.dumps({"template": template or {}, "rules": rules}, ensure_ascii=False)
         self.execute(
-            "INSERT INTO review_batches(id,name,template_id,template_snapshot,rule_version,heartbeat_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
-            (batch_id, name, template_id, snapshot, rule_version, now, now, now),
+            "INSERT INTO review_batches(id,name,template_id,heartbeat_at,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+            (batch_id, name, template_id, now, now, now),
         )
         self.execute(
             "INSERT INTO jobs(id,batch_id,created_at,updated_at) VALUES(?,?,?,?)",
@@ -338,7 +331,7 @@ class ReviewDatabase:
 
     def update_finding_status(self, finding_id: int, new_status: str, note: str = "",
                               correction: str = "", evidence: str = "", service_fingerprint: str = "") -> None:
-        row = self.one("SELECT status,batch_id,rule_code,rule_version FROM findings WHERE id=?", (finding_id,))
+        row = self.one("SELECT status,batch_id FROM findings WHERE id=?", (finding_id,))
         if not row:
             raise ValueError("问题不存在")
         with self.connect() as connection:
@@ -348,10 +341,10 @@ class ReviewDatabase:
                 (finding_id, row["status"], new_status, note, utcnow()),
             )
             connection.execute(
-                """INSERT INTO review_feedback(finding_id,batch_id,action,correction,evidence,note,rule_code,rule_version,
-                   service_fingerprint,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)""",
-                (finding_id, row["batch_id"], new_status, correction, evidence, note, row["rule_code"],
-                 row["rule_version"], service_fingerprint, utcnow()),
+                """INSERT INTO review_feedback(finding_id,batch_id,action,correction,evidence,note,
+                   service_fingerprint,created_at) VALUES(?,?,?,?,?,?,?,?)""",
+                (finding_id, row["batch_id"], new_status, correction, evidence, note,
+                 service_fingerprint, utcnow()),
             )
 
     def request_cancel(self, batch_id: str) -> bool:
@@ -429,6 +422,20 @@ class ReviewDatabase:
         """Recover work interrupted when this project's single worker was stopped."""
         now = utcnow()
         with self.connect() as connection:
+            cancelled = connection.execute(
+                """SELECT j.batch_id FROM jobs j JOIN review_batches b ON b.id=j.batch_id
+                   WHERE b.cancel_requested=1 AND b.status='cancel_requested'"""
+            ).fetchall()
+            if cancelled:
+                connection.execute(
+                    """UPDATE jobs SET status='cancelled',updated_at=? WHERE batch_id IN
+                       (SELECT id FROM review_batches WHERE cancel_requested=1 AND status='cancel_requested')""", (now,)
+                )
+                connection.executemany(
+                    """UPDATE review_batches SET status='cancelled',stage='已取消',cancelled_at=?,
+                       activity='审核在 worker 重启时完成停止',resource='本地 worker',heartbeat_at=?,updated_at=? WHERE id=?""",
+                    [(now, now, now, row["batch_id"]) for row in cancelled],
+                )
             rows = connection.execute(
                 """SELECT j.batch_id FROM jobs j JOIN review_batches b ON b.id=j.batch_id
                    WHERE j.status='running' AND b.cancel_requested=0 AND b.deleted_at=''"""

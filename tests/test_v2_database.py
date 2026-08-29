@@ -51,3 +51,17 @@ def test_interrupted_job_is_requeued_with_visible_activity(tmp_path: Path) -> No
     assert "重新进入队列" in batch["activity"]
     assert batch["heartbeat_at"]
     assert job and job["status"] == "queued"
+
+
+def test_cancel_requested_job_is_finished_on_worker_restart(tmp_path: Path) -> None:
+    db = ReviewDatabase(tmp_path / "review.db")
+    batch_id = db.create_batch(None)
+    assert db.claim_job() is not None
+    assert db.request_cancel(batch_id)
+
+    assert db.requeue_running_jobs() == 0
+
+    batch = db.one("SELECT status,stage FROM review_batches WHERE id=?", (batch_id,))
+    job = db.one("SELECT status FROM jobs WHERE batch_id=?", (batch_id,))
+    assert batch == {"status": "cancelled", "stage": "已取消"}
+    assert job == {"status": "cancelled"}

@@ -39,7 +39,7 @@ class ServiceSettings:
 
     @property
     def uses_remote(self) -> bool:
-        return any(is_remote_url(url) for url in (self.llm_base_url, self.embedding_base_url, self.ocr_base_url))
+        return any(is_remote_url(url) for url in (self.llm_base_url, self.ocr_base_url))
 
 
 class KeyVault:
@@ -65,7 +65,6 @@ class ConfigStore:
     SECRET_FIELDS = {"llm_api_key", "embedding_api_key", "ocr_api_key"}
     PRESET_FIELDS = {
         "llm": ("llm_base_url", "llm_api_key", "llm_model", "llm_temperature"),
-        "embedding": ("embedding_base_url", "embedding_api_key", "embedding_model", "embedding_dimensions"),
         "ocr": ("ocr_base_url", "ocr_api_key", "ocr_backend", "ocr_lang"),
     }
 
