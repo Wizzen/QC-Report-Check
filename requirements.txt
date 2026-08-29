@@ -1,4 +1,4 @@
-streamlit>=1.41,<2
+streamlit>=1.62,<2
 cryptography>=44,<47
 pandas>=2.2,<3
 openpyxl>=3.1,<4

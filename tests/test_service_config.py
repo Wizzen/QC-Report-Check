@@ -116,17 +116,22 @@ def test_llm_ping_reports_reachable_service(tmp_path: Path) -> None:
     assert result["detail"] == "连接成功"
 
 
-def test_llm_test_without_model_skips_json_probe(tmp_path: Path) -> None:
+def test_llm_test_without_model_discovers_and_probes_first_available_model(tmp_path: Path) -> None:
     settings = _store(tmp_path).save({"llm_model": ""})
-    response = Mock()
-    response.status_code = 200
-    response.raise_for_status.return_value = None
+    models = Mock(status_code=200)
+    models.raise_for_status.return_value = None
+    models.json.return_value = {"data": [{"id": "auto-model"}]}
+    generation = Mock(status_code=200)
+    generation.raise_for_status.return_value = None
+    generation.json.return_value = {"choices": [{"message": {"content": '{"ok":true}'}}]}
 
-    with patch("app.integrations.clients.requests.get", return_value=response):
+    with patch("app.integrations.clients.requests.get", return_value=models), \
+         patch("app.integrations.clients.requests.post", return_value=generation) as post:
         result = LLMClient(settings).test()
 
     assert result["ok"] is True
-    assert "默认模型" in result["detail"]
+    assert "auto-model" in result["detail"]
+    assert post.call_args.kwargs["json"]["model"] == "auto-model"
 
 
 def test_llm_json_request_uses_broad_openai_compatible_payload(tmp_path: Path) -> None:
@@ -145,11 +150,62 @@ def test_llm_json_request_uses_broad_openai_compatible_payload(tmp_path: Path) -
     assert "response_format" not in payload
 
 
+def test_qwen_thinking_switch_is_sent_only_when_requested(tmp_path: Path) -> None:
+    settings = _store(tmp_path).save({"llm_model": "qwen3.5-4b"})
+    response = Mock()
+    response.raise_for_status.return_value = None
+    response.json.return_value = {"choices": [{"message": {"content": '{"ok": true}'}}]}
+
+    with patch.object(LLMClient, "_uses_lm_studio_native_api", return_value=False), \
+         patch("app.integrations.clients.requests.post", return_value=response) as request:
+        LLMClient(settings).generate_json("test", retries=0, thinking=False)
+
+    assert request.call_args.kwargs["json"]["chat_template_kwargs"] == {"enable_thinking": False}
+
+
+def test_lm_studio_native_api_disables_reasoning_and_parses_message(tmp_path: Path) -> None:
+    settings = _store(tmp_path).save({"llm_base_url": "http://127.0.0.1:1234/v1", "llm_model": "qwen3.5-4b"})
+    models = Mock(status_code=200)
+    models.json.return_value = {
+        "object": "list", "data": [{"id": "qwen3.5-4b", "compatibility_type": "gguf"}],
+    }
+    response = Mock()
+    response.raise_for_status.return_value = None
+    response.json.return_value = {
+        "output": [{"type": "message", "content": '{"ok": true}'}],
+        "stats": {"reasoning_output_tokens": 0},
+    }
+
+    with patch("app.integrations.clients.requests.get", return_value=models) as get, \
+         patch("app.integrations.clients.requests.post", return_value=response) as post:
+        result = LLMClient(settings).generate_json("test", retries=0, thinking=False, max_tokens=1200)
+
+    assert result == {"ok": True}
+    assert get.call_args.args[0] == "http://127.0.0.1:1234/api/v0/models"
+    assert post.call_args.args[0] == "http://127.0.0.1:1234/api/v1/chat"
+    assert post.call_args.kwargs["json"]["reasoning"] == "off"
+    assert post.call_args.kwargs["json"]["max_output_tokens"] == 1200
+    assert "messages" not in post.call_args.kwargs["json"]
+
+
+def test_llm_non_retryable_422_fails_once(tmp_path: Path) -> None:
+    settings = _store(tmp_path).save({"llm_model": "qwen-test"})
+    response = Mock(status_code=422, reason="Unprocessable Entity", text='{"detail":"bad request"}')
+    response.raise_for_status.side_effect = __import__("requests").HTTPError(response=response)
+
+    with patch("app.integrations.clients.requests.post", return_value=response) as request:
+        with pytest.raises(RuntimeError, match="422"):
+            LLMClient(settings).generate_json("test", retries=2)
+
+    assert request.call_count == 1
+
+
 def test_llm_connection_test_has_short_bounded_probe(tmp_path: Path) -> None:
     settings = _store(tmp_path).save({"llm_model": "slow-model"})
     client = LLMClient(settings)
 
     with patch.object(client, "ping", return_value={"ok": True, "detail": "连接成功"}), \
+         patch.object(client, "_uses_lm_studio_native_api", return_value=False), \
          patch("app.integrations.clients.requests.post", side_effect=RuntimeError("Read timed out")) as request:
         result = client.test()
 
@@ -158,6 +214,19 @@ def test_llm_connection_test_has_short_bounded_probe(tmp_path: Path) -> None:
     assert "模型可能仍在加载" in result["detail"]
     assert request.call_args.kwargs["timeout"] == 20
     assert request.call_args.kwargs["json"]["max_tokens"] == 16
+
+
+def test_llm_test_with_blank_model_reports_model_discovery_timeout(tmp_path: Path) -> None:
+    settings = _store(tmp_path).save({"llm_model": ""})
+    client = LLMClient(settings)
+
+    with patch.object(client, "ping", return_value={"ok": True, "detail": "连接成功"}), \
+         patch.object(client, "resolve_model", side_effect=RuntimeError("Read timed out")):
+        result = client.test()
+
+    assert result["ok"] is False
+    assert "尚未识别" in result["detail"]
+    assert "20 秒" in result["detail"]
 
 
 def test_llm_reports_reasoning_only_response_clearly(tmp_path: Path) -> None:

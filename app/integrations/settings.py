@@ -20,6 +20,8 @@ class ServiceSettings:
     llm_api_key: str
     llm_model: str
     llm_temperature: float
+    llm_concurrency: int
+    llm_timeout_seconds: int
     embedding_base_url: str
     embedding_api_key: str
     embedding_model: str
@@ -64,7 +66,7 @@ class KeyVault:
 class ConfigStore:
     SECRET_FIELDS = {"llm_api_key", "embedding_api_key", "ocr_api_key"}
     PRESET_FIELDS = {
-        "llm": ("llm_base_url", "llm_api_key", "llm_model", "llm_temperature"),
+        "llm": ("llm_base_url", "llm_api_key", "llm_model", "llm_temperature", "llm_concurrency", "llm_timeout_seconds"),
         "ocr": ("ocr_base_url", "ocr_api_key", "ocr_backend", "ocr_lang"),
     }
 
@@ -83,6 +85,8 @@ class ConfigStore:
             llm_base_url=normalize_openai_url(row["llm_base_url"]),
             llm_api_key=row["llm_api_key"], llm_model=row["llm_model"],
             llm_temperature=float(row["llm_temperature"]),
+            llm_concurrency=max(1, min(16, int(row.get("llm_concurrency") or 1))),
+            llm_timeout_seconds=max(15, min(300, int(row.get("llm_timeout_seconds") or 300))),
             embedding_base_url=normalize_openai_url(row["embedding_base_url"], ollama=True),
             embedding_api_key=row["embedding_api_key"], embedding_model=row["embedding_model"],
             embedding_dimensions=int(row["embedding_dimensions"]),
@@ -107,6 +111,7 @@ class ConfigStore:
                 values[field] = self.vault.encrypt(str(supplied))
         allowed = {
             "allow_remote", "llm_base_url", "llm_api_key", "llm_model", "llm_temperature",
+            "llm_concurrency", "llm_timeout_seconds",
             "embedding_base_url", "embedding_api_key", "embedding_model", "embedding_dimensions",
             "ocr_base_url", "ocr_api_key", "ocr_backend", "ocr_lang", "chunk_size", "chunk_overlap", "top_k",
         }

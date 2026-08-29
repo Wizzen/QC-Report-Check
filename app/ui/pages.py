@@ -12,6 +12,7 @@ import streamlit as st
 
 from app.exporters import export_batch, export_batch_pdf
 from app.config import ROOT
+from app.auditing.expert_review import parse_template_tasks
 from app.integrations import LLMClient, MinerUClient
 from app.integrations.settings import mask_secret
 from app.ui.context import get_context
@@ -29,6 +30,17 @@ def start_review_page() -> None:
     template_options = {row["name"]: row["id"] for row in templates}
     chosen_name = st.selectbox("审核模板", list(template_options), key="review_template")
     template_id = template_options.get(chosen_name)
+    review_mode_label = st.segmented_control(
+        "审核方式", ["自适应审核", "思考模式深度复核"], default="自适应审核",
+        key="review_mode", width="stretch",
+    )
+    review_mode = "deep" if review_mode_label == "思考模式深度复核" else "adaptive"
+    if review_mode == "adaptive":
+        st.caption("每个必检项只调用一次模型，使用紧凑 JSON；无法定位的证据自动转人工复核。推荐 LM Studio 使用单路调用。")
+    else:
+        st.caption("每一条必检项都启用思考模式，速度较慢，并会占用更多上下文和显存。")
+        if "qwen3.5-4b" in settings.llm_model.casefold():
+            st.warning("当前 qwen3.5-4b 的完整思考实测可能超过 300 秒。建议本机日常审核选择“自适应审核”。", icon=":material/timer:")
     basis = ctx.db.query("SELECT id,original_name,document_kind FROM documents WHERE library_code='basis' AND parse_status='completed' ORDER BY created_at DESC")
     built_in_label = f"{chosen_name} · 内置模板规则（自动启用）"
     basis_options = {built_in_label: None, **{
@@ -41,18 +53,20 @@ def start_review_page() -> None:
     selected_ids = [basis_options[label] for label in selected_labels if basis_options[label]]
     if not basis:
         st.caption("当前使用审核模板内置规则；审核依据库暂无额外标准，可稍后导入采购要求、图纸或标准。")
+    upload_generation = int(st.session_state.get("upload_event_generation", 0))
     left, right = st.columns(2, gap="large")
     with left:
         st.html('<div class="qaqc-file-label">供应商质量文件　<span style="color:#b42318">必填</span></div>')
         supplier_files = st.file_uploader("供应商质量文件", type=["pdf", "docx", "xlsx", "jpg", "jpeg", "png"],
-                                          accept_multiple_files=True, label_visibility="collapsed", key="upload_supplier")
+                                          accept_multiple_files=True, label_visibility="collapsed",
+                                          key=f"upload_supplier_{upload_generation}")
         st.caption("支持 PDF、DOCX、XLSX、JPG、PNG；可一次上传多份证明书和报告。")
     with right:
         st.html('<div class="qaqc-file-label">本次补充审核依据　<span style="color:#667085">可选</span></div>')
         supplemental = st.file_uploader("本次补充依据", type=["pdf", "docx", "xlsx", "txt"],
-                                        accept_multiple_files=True, label_visibility="collapsed", key="upload_supplemental")
+                                        accept_multiple_files=True, label_visibility="collapsed",
+                                        key=f"upload_supplemental_{upload_generation}")
         st.caption("临时采购要求、图纸或协议优先级最高，并自动存入审核依据库。")
-    st.space("small")
     if settings.uses_remote:
         st.warning("当前配置包含公网服务。本次文件内容可能发送到已配置的外部 LLM 或 OCR 地址。", icon=":material/cloud_upload:")
     if st.button("开始审核", type="primary", width="stretch", icon=":material/play_arrow:", key="start_review"):
@@ -60,10 +74,16 @@ def start_review_page() -> None:
             st.error("请至少上传一份供应商质量文件。", icon=":material/error:")
         else:
             try:
-                batch_id = ctx.service.create_review(template_id, selected_ids, supplier_files, supplemental or [])
+                batch_id = ctx.service.create_review(
+                    template_id, selected_ids, supplier_files, supplemental or [], review_mode
+                )
                 st.session_state["active_batch"] = batch_id
                 st.toast("审核任务已创建", icon=":material/check_circle:")
                 st.session_state["record_batch"] = batch_id
+                # A completed submission starts a fresh upload event. This clears
+                # the uploader widgets without changing the batch being monitored.
+                st.session_state["upload_event_generation"] = upload_generation + 1
+                st.rerun()
             except Exception as exc:
                 st.error(f"创建审核任务失败：{exc}")
     batch_id = st.session_state.get("active_batch")
@@ -83,6 +103,7 @@ def batch_status_card(batch_id: str) -> None:
             st.subheader(batch["name"])
             st.badge(_status_label(batch["status"]), color=_status_color(batch["status"]))
         st.caption(f"供应商：{batch.get('supplier_name') or ('正在根据 OCR/LLM 识别' if batch['status'] in {'queued', 'running'} else '未识别')}")
+        st.caption(f"审核方式：{'思考模式深度复核' if batch.get('review_mode') == 'deep' else '自适应审核'}")
         st.progress(int(batch["progress"]), text=f"{batch['stage']} {('· ' + batch['current_file']) if batch['current_file'] else ''}")
         age = _heartbeat_age(batch.get("heartbeat_at") or batch.get("updated_at"))
         activity = batch.get("activity") or "等待 worker 更新当前操作"
@@ -666,43 +687,87 @@ def templates_page() -> None:
     basis = ctx.db.query("SELECT id,original_name FROM documents WHERE library_code='basis' AND parse_status='completed' ORDER BY created_at DESC")
     basis_labels = {row["original_name"]: row["id"] for row in basis}
     attached = [] if not selected else [row["document_id"] for row in ctx.db.query("SELECT document_id FROM template_basis WHERE template_id=?", (selected["id"],))]
-    st.info("每一行必检项目都会成为一个独立 LLM 审核任务。新增一行即可扩展审核规则，无需修改程序；所有任务完成后统一汇总。", icon=":material/account_tree:")
-    with st.form("template_editor"):
-        name = st.text_input("模板名称", value=selected["name"] if selected else "")
-        description = st.text_area("说明", value=selected["description"] if selected else "")
-        required = st.text_area(
-            "必检项目（每行一个 = 一次独立 LLM 判断）",
-            value="\n".join(json.loads(selected["required_items"] or "[]")) if selected else "",
-            help="系统按行顺序逐条调用 LLM；一条失败不会中断后续任务。",
-        )
-        instructions = st.text_area(
-            "专家审核说明",
-            value=str(selected.get("review_instructions") or "") if selected else "",
-            height=260,
-            help="所有独立任务共用的审核边界、术语和判断要求。这里的行不会额外产生 LLM 调用。",
-        )
-        default_basis = st.multiselect("默认审核依据", list(basis_labels), default=[label for label, doc_id in basis_labels.items() if doc_id in attached])
-        enabled = st.toggle("启用", value=bool(selected["enabled"]) if selected else True)
-        is_default = st.toggle("设为默认模板", value=bool(selected["is_default"]) if selected else False)
-        if st.form_submit_button("保存模板", type="primary", icon=":material/save:"):
-            if not name.strip():
-                st.error("模板名称不能为空。")
+    st.info("每个启用的表格行都是一次独立 LLM 审核。任务会按系统设置的并发数同时执行，完成后统一汇总。", icon=":material/account_tree:")
+    token = str(selected["id"] if selected else "new")
+    rows_key = f"template_task_rows_{token}"
+    revision_key = f"template_task_revision_{token}"
+    select_state_key = f"template_task_select_all_last_{token}"
+    if rows_key not in st.session_state:
+        st.session_state[rows_key] = [
+            {"选择": False, "启用": bool(row["enabled"]), "必检项目": str(row["text"])}
+            for row in parse_template_tasks(selected["required_items"] if selected else "[]")
+        ]
+        st.session_state[revision_key] = 0
+        st.session_state[select_state_key] = False
+
+    name = st.text_input("模板名称", value=selected["name"] if selected else "", key=f"template_name_{token}")
+    description = st.text_area("说明", value=selected["description"] if selected else "", key=f"template_description_{token}")
+    select_all = st.checkbox("全选", value=False, key=f"template_select_all_{token}")
+    if select_all != st.session_state[select_state_key]:
+        st.session_state[rows_key] = [{**row, "选择": select_all} for row in st.session_state[rows_key]]
+        st.session_state[select_state_key] = select_all
+        st.session_state[revision_key] += 1
+    task_frame = pd.DataFrame(st.session_state[rows_key], columns=["选择", "启用", "必检项目"])
+    edited_tasks = st.data_editor(
+        task_frame, hide_index=True, width="stretch", num_rows="dynamic",
+        key=f"template_task_editor_{token}_{st.session_state[revision_key]}",
+        column_config={
+            "选择": st.column_config.CheckboxColumn("选择", help="用于批量删除"),
+            "启用": st.column_config.CheckboxColumn("启用", help="启用后，本项会独立调用一次 LLM"),
+            "必检项目": st.column_config.TextColumn("必检项目", required=True, width="large"),
+        },
+    )
+    current_rows = edited_tasks.fillna({"选择": False, "启用": True, "必检项目": ""}).to_dict("records")
+    st.session_state[rows_key] = current_rows
+    with st.container(horizontal=True):
+        if st.button("增加一项", icon=":material/add:", key=f"template_add_task_{token}"):
+            st.session_state[rows_key] = [*current_rows, {"选择": False, "启用": True, "必检项目": ""}]
+            st.session_state[revision_key] += 1
+            st.rerun()
+        selected_count = sum(bool(row.get("选择")) for row in current_rows)
+        if st.button("删除已选", icon=":material/delete:", key=f"template_delete_tasks_{token}", disabled=selected_count == 0):
+            st.session_state[rows_key] = [row for row in current_rows if not bool(row.get("选择"))]
+            st.session_state[revision_key] += 1
+            st.session_state[select_state_key] = False
+            st.rerun()
+        st.caption(f"共 {len(current_rows)} 项，已启用 {sum(bool(row.get('启用')) for row in current_rows)} 项，已选择 {selected_count} 项。")
+
+    instructions = st.text_area(
+        "专家审核说明", value=str(selected.get("review_instructions") or "") if selected else "", height=260,
+        key=f"template_instructions_{token}",
+        help="所有独立任务共用的审核边界、术语和判断要求。这里不会额外产生 LLM 调用。",
+    )
+    default_basis = st.multiselect(
+        "默认审核依据", list(basis_labels),
+        default=[label for label, doc_id in basis_labels.items() if doc_id in attached], key=f"template_basis_{token}",
+    )
+    enabled = st.toggle("启用", value=bool(selected["enabled"]) if selected else True, key=f"template_enabled_{token}")
+    is_default = st.toggle("设为默认模板", value=bool(selected["is_default"]) if selected else False, key=f"template_default_{token}")
+    if st.button("保存模板", type="primary", icon=":material/save:", key=f"template_save_{token}"):
+        task_items = [
+            {"text": str(row.get("必检项目") or "").strip(), "enabled": bool(row.get("启用"))}
+            for row in current_rows if str(row.get("必检项目") or "").strip()
+        ]
+        if not name.strip():
+            st.error("模板名称不能为空。")
+        elif not task_items:
+            st.error("请至少增加一个必检项目。")
+        else:
+            if selected:
+                template_id = selected["id"]
+                ctx.db.execute("UPDATE audit_templates SET name=?,description=?,required_items=?,review_instructions=?,enabled=?,is_default=? WHERE id=?",
+                               (name.strip(), description.strip(), json.dumps(task_items, ensure_ascii=False), instructions.strip(), int(enabled), int(is_default), template_id))
             else:
-                items = [line.strip() for line in required.splitlines() if line.strip()]
-                if selected:
-                    template_id = selected["id"]
-                    ctx.db.execute("UPDATE audit_templates SET name=?,description=?,required_items=?,review_instructions=?,enabled=?,is_default=? WHERE id=?",
-                                   (name.strip(), description.strip(), json.dumps(items, ensure_ascii=False), instructions.strip(), int(enabled), int(is_default), template_id))
-                else:
-                    template_id = ctx.db.execute("""INSERT INTO audit_templates(name,description,required_document_types,required_items,review_instructions,enabled,is_default,created_at)
-                        VALUES(?,?,?,?,?,?,?,datetime('now'))""", (name.strip(), description.strip(), "[]", json.dumps(items, ensure_ascii=False), instructions.strip(), int(enabled), int(is_default)))
-                if is_default:
-                    ctx.db.execute("UPDATE audit_templates SET is_default=0 WHERE id<>?", (template_id,))
-                with ctx.db.connect() as connection:
-                    connection.execute("DELETE FROM template_basis WHERE template_id=?", (template_id,))
-                    connection.executemany("INSERT INTO template_basis(template_id,document_id) VALUES(?,?)",
-                                           [(template_id, basis_labels[label]) for label in default_basis])
-                st.success("模板已保存。"); st.rerun()
+                template_id = ctx.db.execute("""INSERT INTO audit_templates(name,description,required_document_types,required_items,review_instructions,enabled,is_default,created_at)
+                    VALUES(?,?,?,?,?,?,?,datetime('now'))""", (name.strip(), description.strip(), "[]", json.dumps(task_items, ensure_ascii=False), instructions.strip(), int(enabled), int(is_default)))
+            if is_default:
+                ctx.db.execute("UPDATE audit_templates SET is_default=0 WHERE id<>?", (template_id,))
+            with ctx.db.connect() as connection:
+                connection.execute("DELETE FROM template_basis WHERE template_id=?", (template_id,))
+                connection.executemany("INSERT INTO template_basis(template_id,document_id) VALUES(?,?)",
+                                       [(template_id, basis_labels[label]) for label in default_basis])
+            st.success("模板已保存。")
+            st.rerun()
 def settings_page() -> None:
     ctx = get_context()
     _section_header("系统设置", "配置 LLM 和 OCR 服务。审核依据使用本地关键词与结构化规则，不需要向量模型。")
@@ -725,8 +790,16 @@ def settings_page() -> None:
         st.subheader("LLM 大模型")
         llm_url = st.text_input("LLM Base URL", current.llm_base_url)
         llm_key = st.text_input("LLM API Key", mask_secret(current.llm_api_key), type="password")
-        llm_model = st.text_input("LLM 模型", current.llm_model, placeholder="留空则使用服务端默认模型，例如 Qwen3.8-27B-4bit")
+        llm_model = st.text_input(
+            "LLM 模型", current.llm_model,
+            placeholder="可留空：自动读取 /models 返回的第一个模型",
+            help="建议明确填写模型 ID。留空时程序会先访问 Base URL 的 /models，并自动采用第一个可用模型。",
+        )
         llm_temp = st.number_input("温度", 0.0, 2.0, current.llm_temperature, 0.1)
+        llm_concurrency = st.number_input("LLM 并发数", 1, 16, current.llm_concurrency, 1,
+                                          help="默认 1。LM Studio 单模型建议保持 1；只有服务端明确支持并行推理时再提高。")
+        llm_timeout = st.number_input("单条 LLM 读取超时（秒）", 15, 300, current.llm_timeout_seconds, 5,
+                                      help="默认 300 秒，为思考模型保留生成最终 JSON 的时间；超时只影响当前任务。")
         st.subheader("MinerU OCR")
         ocr_url = st.text_input("OCR Base URL", current.ocr_base_url)
         ocr_key = st.text_input("OCR API Key", mask_secret(current.ocr_api_key), type="password")
@@ -737,6 +810,7 @@ def settings_page() -> None:
         try:
             updated = ctx.config_store.save({"allow_remote": allow_remote, "llm_base_url": llm_url, "llm_api_key": llm_key,
                 "llm_model": llm_model, "llm_temperature": llm_temp,
+                "llm_concurrency": llm_concurrency, "llm_timeout_seconds": llm_timeout,
                 "ocr_base_url": ocr_url, "ocr_api_key": ocr_key, "ocr_backend": ocr_backend, "ocr_lang": ocr_lang})
             st.success("配置已保存。")
         except Exception as exc:

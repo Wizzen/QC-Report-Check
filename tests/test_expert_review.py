@@ -7,6 +7,8 @@ from app.auditing.expert_review import (
     deterministic_fastener_audit,
     extract_supplier_names,
     findings_from_llm,
+    enabled_template_tasks,
+    parse_template_tasks,
     rule_evaluation_from_llm,
     supplier_names_from_llm,
 )
@@ -32,6 +34,15 @@ Dimensions Of SPEC
     assert any(item.item == "Thread Length" and item.severity == "Major" for item in findings)
     assert any(item.item.startswith("HV(2)") and item.severity == "Review" for item in findings)
     assert any(item.item == "A1 文件完整性" and "COC" in item.description for item in findings)
+
+
+def test_template_tasks_support_legacy_rows_and_enabled_table_rows() -> None:
+    assert enabled_template_tasks('["炉号", "材料"]') == ["炉号", "材料"]
+    raw = '[{"text":"炉号一致性","enabled":true},{"text":"停用任务","enabled":false}]'
+
+    assert parse_template_tasks(raw) == [
+        {"text": "炉号一致性", "enabled": True}, {"text": "停用任务", "enabled": False}]
+    assert enabled_template_tasks(raw) == ["炉号一致性"]
 
 
 def test_llm_findings_require_exact_page_evidence() -> None:
@@ -62,14 +73,18 @@ def test_independent_rule_accepts_pass_without_creating_a_finding() -> None:
     assert finding is None
 
 
-def test_independent_rule_rejects_fabricated_problem_evidence() -> None:
+def test_independent_rule_downgrades_fabricated_evidence_without_publishing_it() -> None:
     document = ExpertDocument("MTR.pdf", Path("sample.pdf"), [PageText(1, "Heat No: H123")])
 
-    with pytest.raises(ValueError, match="可核验"):
-        rule_evaluation_from_llm(
-            {"result": "不合格", "source_file": "MTR.pdf", "page": 1, "evidence": "Heat No: FAKE"},
-            "检查炉号是否一致", [document],
-        )
+    evaluation, finding = rule_evaluation_from_llm(
+        {"r": "不合格", "f": "MTR.pdf", "p": 1, "e": "Heat No: FAKE", "c": "炉号冲突"},
+        "检查炉号是否一致", [document],
+    )
+
+    assert evaluation["status"] == "存疑"
+    assert evaluation["evidence"] == ""
+    assert evaluation["evidence_type"] == "unlocated"
+    assert finding and finding.severity == "Review" and finding.source_text == ""
 
 
 def test_independent_rule_accepts_missing_field_with_checked_scope() -> None:
@@ -93,7 +108,7 @@ def test_wdc_is_recovered_from_filename() -> None:
 
 def test_supplier_names_are_extracted_and_buyer_is_excluded() -> None:
     document = ExpertDocument("MTR.pdf", Path("sample.pdf"), [PageText(1, """
-Customer: CUSTOMER COMPANY
+Customer: SAMPLE BUYER COMPANY
 Manufacturer: NINGBO JINDING FASTENING PIECE CO.,LTD
 Mill: HENAN JIYUAN IRON&STEEL CO.,LTD
 """)])

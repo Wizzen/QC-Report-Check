@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS audit_templates (
 CREATE TABLE IF NOT EXISTS review_batches (
   id TEXT PRIMARY KEY, name TEXT NOT NULL, template_id INTEGER,
   supplier_name TEXT NOT NULL DEFAULT '',
+  review_mode TEXT NOT NULL DEFAULT 'adaptive',
   status TEXT NOT NULL DEFAULT 'queued', stage TEXT NOT NULL DEFAULT '等待处理',
   progress INTEGER NOT NULL DEFAULT 0, current_file TEXT NOT NULL DEFAULT '',
   activity TEXT NOT NULL DEFAULT '任务已进入本地队列', resource TEXT NOT NULL DEFAULT 'SQLite 本地任务队列',
@@ -104,7 +105,8 @@ CREATE TABLE IF NOT EXISTS review_history (
 CREATE TABLE IF NOT EXISTS service_config (
   id INTEGER PRIMARY KEY CHECK(id=1), allow_remote INTEGER NOT NULL DEFAULT 0,
   llm_base_url TEXT NOT NULL DEFAULT 'http://127.0.0.1:8080/v1', llm_api_key TEXT NOT NULL DEFAULT '',
-  llm_model TEXT NOT NULL DEFAULT '', llm_temperature REAL NOT NULL DEFAULT 0.2,
+  llm_model TEXT NOT NULL DEFAULT '', llm_temperature REAL NOT NULL DEFAULT 0.0,
+  llm_concurrency INTEGER NOT NULL DEFAULT 1, llm_timeout_seconds INTEGER NOT NULL DEFAULT 300,
   embedding_base_url TEXT NOT NULL DEFAULT 'http://127.0.0.1:11434/v1', embedding_api_key TEXT NOT NULL DEFAULT '',
   embedding_model TEXT NOT NULL DEFAULT 'bge-m3:latest', embedding_dimensions INTEGER NOT NULL DEFAULT 1024,
   ocr_base_url TEXT NOT NULL DEFAULT 'http://127.0.0.1:8888', ocr_api_key TEXT NOT NULL DEFAULT '',
@@ -223,6 +225,7 @@ class ReviewDatabase:
             columns = {row[1] for row in connection.execute("PRAGMA table_info(review_batches)").fetchall()}
             for name, declaration in {
                 "supplier_name": "TEXT NOT NULL DEFAULT ''",
+                "review_mode": "TEXT NOT NULL DEFAULT 'adaptive'",
                 "activity": "TEXT NOT NULL DEFAULT '任务已进入本地队列'",
                 "resource": "TEXT NOT NULL DEFAULT 'SQLite 本地任务队列'",
                 "heartbeat_at": "TEXT NOT NULL DEFAULT ''",
@@ -256,6 +259,13 @@ class ReviewDatabase:
             template_columns = {row[1] for row in connection.execute("PRAGMA table_info(audit_templates)").fetchall()}
             if "review_instructions" not in template_columns:
                 connection.execute("ALTER TABLE audit_templates ADD COLUMN review_instructions TEXT NOT NULL DEFAULT ''")
+            service_columns = {row[1] for row in connection.execute("PRAGMA table_info(service_config)").fetchall()}
+            for name, declaration in {
+                "llm_concurrency": "INTEGER NOT NULL DEFAULT 1",
+                "llm_timeout_seconds": "INTEGER NOT NULL DEFAULT 300",
+            }.items():
+                if name not in service_columns:
+                    connection.execute(f"ALTER TABLE service_config ADD COLUMN {name} {declaration}")
             connection.executemany(
                 "INSERT OR IGNORE INTO document_libraries(code,name,description) VALUES(?,?,?)",
                 [
@@ -287,13 +297,20 @@ class ReviewDatabase:
         rows = self.query(sql, params)
         return rows[0] if rows else None
 
-    def create_batch(self, template_id: int | None) -> str:
+    def create_batch(self, template_id: int | None, review_mode: str = "adaptive") -> str:
         batch_id = str(uuid.uuid4())
         now = utcnow()
-        name = f"审核批次 {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+        # Seconds make repeated uploads visibly distinct while the UUID remains the
+        # stable event identity used by storage, jobs and findings.
+        name = f"审核批次 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        template = self.one(
+            "SELECT name,description,required_items,review_instructions FROM audit_templates WHERE id=?", (template_id,)
+        ) if template_id else None
+        snapshot = json.dumps(template or {}, ensure_ascii=False)
+        review_mode = review_mode if review_mode in {"adaptive", "deep"} else "adaptive"
         self.execute(
-            "INSERT INTO review_batches(id,name,template_id,heartbeat_at,created_at,updated_at) VALUES(?,?,?,?,?,?)",
-            (batch_id, name, template_id, now, now, now),
+            "INSERT INTO review_batches(id,name,template_id,review_mode,template_snapshot,heartbeat_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+            (batch_id, name, template_id, review_mode, snapshot, now, now, now),
         )
         self.execute(
             "INSERT INTO jobs(id,batch_id,created_at,updated_at) VALUES(?,?,?,?)",

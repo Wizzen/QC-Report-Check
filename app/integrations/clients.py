@@ -6,8 +6,10 @@ import mimetypes
 import re
 import time
 import uuid
+from threading import Lock
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 import requests
 
@@ -40,7 +42,113 @@ def _request_error(endpoint: str, exc: Exception) -> str:
 class LLMClient:
     def __init__(self, settings: ServiceSettings):
         self.settings = settings
+        self._resolved_model = settings.llm_model.strip()
+        self._model_lock = Lock()
+        self._lm_studio_native: bool | None = None
         ensure_url_allowed(settings.llm_base_url, settings.allow_remote)
+
+    def _native_base_url(self) -> str:
+        """Return the server root behind an OpenAI-compatible ``/v1`` URL."""
+        parsed = urlsplit(self.settings.llm_base_url.rstrip("/"))
+        path = parsed.path.rstrip("/")
+        if path.endswith("/v1"):
+            path = path[:-3]
+        return urlunsplit((parsed.scheme, parsed.netloc, path.rstrip("/"), "", ""))
+
+    def _uses_lm_studio_native_api(self) -> bool:
+        """Detect LM Studio once so provider-specific requests never reach other services."""
+        if self._lm_studio_native is not None:
+            return self._lm_studio_native
+        endpoint = f"{self._native_base_url()}/api/v0/models"
+        try:
+            response = requests.get(
+                endpoint, headers=_headers(self.settings.llm_api_key), timeout=3,
+                **_network_options(endpoint),
+            )
+            if response.status_code != 200:
+                self._lm_studio_native = False
+                return False
+            body = response.json()
+            rows = body.get("data") if isinstance(body, dict) else None
+            self._lm_studio_native = bool(
+                isinstance(rows, list)
+                and (body.get("object") == "list" or any(
+                    isinstance(row, dict) and "compatibility_type" in row for row in rows
+                ))
+            )
+        except (requests.RequestException, ValueError, TypeError):
+            self._lm_studio_native = False
+        return bool(self._lm_studio_native)
+
+    def _generate_lm_studio_json(self, prompt: str, model: str, thinking: bool | str,
+                                 timeout_seconds: int, max_tokens: int | None) -> dict[str, Any]:
+        endpoint = f"{self._native_base_url()}/api/v1/chat"
+        payload: dict[str, Any] = {
+            "model": model,
+            "input": prompt,
+            "reasoning": thinking if isinstance(thinking, str) else ("on" if thinking else "off"),
+            "temperature": self.settings.llm_temperature,
+            "stream": False,
+            "store": False,
+        }
+        if max_tokens is not None:
+            payload["max_output_tokens"] = max_tokens
+        response = requests.post(
+            endpoint, headers=_headers(self.settings.llm_api_key), json=payload,
+            timeout=timeout_seconds, **_network_options(endpoint),
+        )
+        response.raise_for_status()
+        body = response.json()
+        if isinstance(body.get("error"), dict):
+            raise ValueError(f"LLM 服务错误：{body['error'].get('message') or '未知错误'}")
+        output = body.get("output")
+        if not isinstance(output, list):
+            raise ValueError("LM Studio 响应缺少 output 字段")
+        messages = [
+            str(item.get("content") or "").strip()
+            for item in output
+            if isinstance(item, dict) and item.get("type") == "message"
+        ]
+        content = "\n".join(part for part in messages if part).strip()
+        if not content:
+            reasoning = any(
+                isinstance(item, dict) and item.get("type") == "reasoning" and str(item.get("content") or "").strip()
+                for item in output
+            )
+            if reasoning:
+                raise ValueError("LLM 只返回推理内容，未返回最终 JSON")
+            raise ValueError("LLM 返回空内容")
+        return parse_json_object(content)
+
+    def available_models(self) -> list[str]:
+        response = requests.get(
+            f"{self.settings.llm_base_url}/models", headers=_headers(self.settings.llm_api_key), timeout=10,
+            **_network_options(self.settings.llm_base_url),
+        )
+        response.raise_for_status()
+        body = response.json()
+        rows = body.get("data") if isinstance(body, dict) else None
+        if not isinstance(rows, list):
+            return []
+        return [str(row.get("id") or "").strip() for row in rows if isinstance(row, dict) and str(row.get("id") or "").strip()]
+
+    def resolve_model(self) -> str:
+        """Use the configured model or discover the first model exposed by /models once."""
+        if self._resolved_model:
+            return self._resolved_model
+        with self._model_lock:
+            if self._resolved_model:
+                return self._resolved_model
+            try:
+                models = self.available_models()
+            except requests.RequestException as exc:
+                raise RuntimeError(f"LLM 模型名称为空，且无法读取 /models：{_request_error(self.settings.llm_base_url + '/models', exc)}") from exc
+            except (ValueError, TypeError) as exc:
+                raise RuntimeError("LLM 模型名称为空，且 /models 返回格式无效") from exc
+            if not models:
+                raise RuntimeError("LLM 模型名称为空，/models 也没有返回可用模型")
+            self._resolved_model = models[0]
+            return self._resolved_model
 
     def ping(self) -> dict[str, Any]:
         try:
@@ -65,10 +173,9 @@ class LLMClient:
         ping = self.ping()
         if not ping["ok"]:
             return ping
-        model = self.settings.llm_model.strip()
-        if not model:
-            return {"ok": True, "detail": "LLM 服务连接正常（未指定模型，将使用服务端默认模型）"}
+        model = self.settings.llm_model.strip() or "尚未识别"
         try:
+            model = self.resolve_model()
             return self._probe_generation(model)
         except Exception as exc:
             if "timed out" in str(exc).casefold():
@@ -77,6 +184,11 @@ class LLMClient:
 
     def _probe_generation(self, model: str) -> dict[str, Any]:
         """Confirm that a model can generate without waiting for a full reasoning answer."""
+        if self._uses_lm_studio_native_api():
+            result = self._generate_lm_studio_json(
+                '只返回 JSON：{"ok":true}', model, False, timeout_seconds=20, max_tokens=16,
+            )
+            return {"ok": bool(result.get("ok")), "detail": f"模型 {model} 返回有效 JSON（LM Studio 快速模式）"}
         response = requests.post(
             f"{self.settings.llm_base_url}/chat/completions",
             headers=_headers(self.settings.llm_api_key),
@@ -105,18 +217,30 @@ class LLMClient:
         return {"ok": False, "detail": f"模型 {model} 返回空响应"}
 
     def generate_json(self, prompt: str, retries: int = 2, timeout_seconds: int = 180,
-                      max_tokens: int | None = None) -> dict[str, Any]:
+                      max_tokens: int | None = None, thinking: bool | str | None = None) -> dict[str, Any]:
         last_error: Exception | None = None
+        last_detail = ""
         for attempt in range(retries + 1):
             try:
+                model = self.resolve_model()
+                request_prompt = prompt + ("\n只输出一个 JSON 对象。" if attempt else "")
+                if thinking is not None and self._uses_lm_studio_native_api():
+                    return self._generate_lm_studio_json(
+                        request_prompt, model, thinking, timeout_seconds, max_tokens,
+                    )
                 payload: dict[str, Any] = {
                     "temperature": self.settings.llm_temperature,
                     "stream": False,
-                    "messages": [{"role": "user", "content": prompt + ("\n只输出一个 JSON 对象。" if attempt else "")}],
+                    "messages": [{"role": "user", "content": request_prompt}],
                 }
-                model = self.settings.llm_model.strip()
-                if model:
-                    payload["model"] = model
+                payload["model"] = model
+                # Qwen3/3.5 exposes a hard thinking switch through its chat
+                # template. Avoid sending this provider-specific field to other
+                # OpenAI-compatible models that may reject unknown parameters.
+                if thinking is not None and re.search(r"qwen[\s._/-]*3", str(payload["model"]), re.IGNORECASE):
+                    payload["chat_template_kwargs"] = {
+                        "enable_thinking": thinking not in {False, "off"},
+                    }
                 if max_tokens is not None:
                     payload["max_tokens"] = max_tokens
                 response = requests.post(
@@ -144,12 +268,18 @@ class LLMClient:
                 return parse_json_object(str(content))
             except (requests.RequestException, KeyError, ValueError, json.JSONDecodeError) as exc:
                 last_error = exc
-                detail = type(exc).__name__
+                detail = str(exc).strip() or type(exc).__name__
                 if isinstance(exc, requests.HTTPError) and exc.response is not None:
                     body = exc.response.text.strip().replace("\n", " ")[:240]
                     detail = f"HTTP {exc.response.status_code}: {body or exc.response.reason}"
                 LOGGER.warning("LLM JSON 响应无效（第 %s 次）: %s", attempt + 1, detail)
-        if isinstance(last_error, Exception) and str(last_error):
+                last_detail = detail
+                if isinstance(exc, requests.HTTPError) and exc.response is not None \
+                        and exc.response.status_code in {400, 401, 403, 404, 422}:
+                    break
+        if last_detail:
+            message = last_detail
+        elif isinstance(last_error, Exception) and str(last_error):
             message = str(last_error)
         elif last_error is not None:
             message = type(last_error).__name__

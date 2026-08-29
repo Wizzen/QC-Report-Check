@@ -6,6 +6,7 @@ import logging
 import mimetypes
 import re
 import shutil
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
 from pathlib import Path
 from typing import BinaryIO, Iterable
@@ -21,6 +22,8 @@ from app.auditing.expert_review import (
     build_rule_task_prompt,
     deterministic_fastener_audit,
     extract_supplier_names,
+    enabled_template_tasks,
+    parse_template_tasks,
     rule_evaluation_from_llm,
 )
 from app.database import ReviewDatabase
@@ -52,18 +55,21 @@ class ReviewService:
         self._backfill_search_evidence()
 
     def _ensure_fastener_template(self) -> None:
-        row = self.db.one("SELECT id FROM audit_templates WHERE name=?", (FASTENER_TEMPLATE_NAME,))
+        row = self.db.one("SELECT id,required_items,review_instructions FROM audit_templates WHERE name=?", (FASTENER_TEMPLATE_NAME,))
         if row:
+            # An explicitly saved all-disabled table is still a valid user configuration.
+            # Only seed the built-in rows when the template truly has no rows at all.
+            required_items = row["required_items"] if parse_template_tasks(row["required_items"]) else json.dumps(FASTENER_REQUIRED_CHECKS, ensure_ascii=False)
+            instructions = row["review_instructions"] or FASTENER_REVIEW_INSTRUCTIONS
             self.db.execute(
                 "UPDATE audit_templates SET review_instructions=?,required_document_types=?,required_items=? WHERE id=?",
-                (FASTENER_REVIEW_INSTRUCTIONS, json.dumps(["COC", "COI/MTR"], ensure_ascii=False),
-                 json.dumps(FASTENER_REQUIRED_CHECKS, ensure_ascii=False), row["id"]),
+                (instructions, json.dumps(["COC", "COI/MTR"], ensure_ascii=False), required_items, row["id"]),
             )
             return
         self.db.execute(
             """INSERT INTO audit_templates(name,description,required_document_types,required_items,review_instructions,
                enabled,is_default,created_at) VALUES(?,?,?,?,?,1,0,?)""",
-            (FASTENER_TEMPLATE_NAME, "按文件/WDC关系、表格实测数据和逐页证据审核 CUSTOMER 紧固件质量文件。",
+            (FASTENER_TEMPLATE_NAME, "按文件/WDC关系、表格实测数据和逐页证据审核通用紧固件质量文件。",
              json.dumps(["COC", "COI/MTR"], ensure_ascii=False),
              json.dumps(FASTENER_REQUIRED_CHECKS, ensure_ascii=False), FASTENER_REVIEW_INSTRUCTIONS, utcnow()),
         )
@@ -104,12 +110,13 @@ class ReviewService:
                     )
 
     def create_review(self, template_id: int | None, selected_basis: list[str],
-                      supplier_files: Iterable[object], supplemental_files: Iterable[object]) -> str:
+                      supplier_files: Iterable[object], supplemental_files: Iterable[object],
+                      review_mode: str = "adaptive") -> str:
         supplier_files = list(supplier_files)
         supplemental_files = list(supplemental_files)
         if not supplier_files:
             raise ValueError("至少需要上传一份供应商质量文件")
-        batch_id = self.db.create_batch(template_id)
+        batch_id = self.db.create_batch(template_id, review_mode)
         destination = self.uploads / batch_id
         for uploaded in supplier_files:
             document_id = self._save_uploaded(uploaded, "supplier", "supplier", destination)
@@ -125,10 +132,10 @@ class ReviewService:
         return batch_id
 
     def retry_review(self, source_batch_id: str) -> str:
-        source = self.db.one("SELECT template_id FROM review_batches WHERE id=?", (source_batch_id,))
+        source = self.db.one("SELECT template_id,review_mode FROM review_batches WHERE id=?", (source_batch_id,))
         if not source:
             raise ValueError("原审核批次不存在")
-        batch_id = self.db.create_batch(source["template_id"])
+        batch_id = self.db.create_batch(source["template_id"], str(source.get("review_mode") or "adaptive"))
         rows = self.db.query("SELECT document_id,role,priority FROM batch_documents WHERE batch_id=?", (source_batch_id,))
         for row in rows:
             self.db.attach_document(batch_id, row["document_id"], row["role"], row["priority"])
@@ -344,8 +351,14 @@ class ReviewService:
         requirements = [Requirement(row["item"], row["operator"], _number_or_text(row["value"]),
             _optional_float(row["upper_value"]), row["unit"], row["raw"], row["source_file"], row["source_page"],
             row["clause"], bool(row["required"])) for row in rule_rows]
-        batch = self.db.one("SELECT template_id FROM review_batches WHERE id=?", (batch_id,))
+        batch = self.db.one("SELECT template_id,template_snapshot,review_mode FROM review_batches WHERE id=?", (batch_id,))
         template = self.db.one("SELECT * FROM audit_templates WHERE id=?", (batch["template_id"],)) if batch and batch["template_id"] else None
+        try:
+            snapshot = json.loads(str(batch.get("template_snapshot") or "{}")) if batch else {}
+        except (ValueError, TypeError):
+            snapshot = {}
+        if template and snapshot:
+            template = {**template, **{key: snapshot[key] for key in ("name", "description", "required_items", "review_instructions") if key in snapshot}}
         findings = AuditEngine().audit(documents, requirements)
         if template and _uses_fastener_audit(template):
             expert_documents = [_expert_document(row) for row in document_rows]
@@ -365,13 +378,16 @@ class ReviewService:
         self._check_cancel(batch_id)
         if not documents:
             return findings
-        batch = self.db.one("SELECT template_id FROM review_batches WHERE id=?", (batch_id,))
+        batch = self.db.one("SELECT template_id,template_snapshot,review_mode FROM review_batches WHERE id=?", (batch_id,))
         template = self.db.one("SELECT required_items,review_instructions FROM audit_templates WHERE id=?", (batch["template_id"],)) if batch and batch["template_id"] else None
-        instructions = str(template.get("review_instructions") or "") if template else ""
         try:
-            tasks = [str(item).strip() for item in json.loads(str(template.get("required_items") or "[]")) if str(item).strip()] if template else []
+            snapshot = json.loads(str(batch.get("template_snapshot") or "{}")) if batch else {}
         except (ValueError, TypeError):
-            tasks = []
+            snapshot = {}
+        task_source = snapshot.get("required_items") if snapshot else (template.get("required_items") if template else "[]")
+        tasks = enabled_template_tasks(task_source)
+        review_mode = str(batch.get("review_mode") or "adaptive") if batch else "adaptive"
+        instructions = str(snapshot.get("review_instructions") or (template.get("review_instructions") if template else "") or "")
         with self.db.connect() as connection:
             connection.execute("DELETE FROM rule_evaluations WHERE batch_id=?", (batch_id,))
             connection.executemany(
@@ -392,45 +408,93 @@ class ReviewService:
                WHERE bd.batch_id=? AND bd.role IN ('selected_basis','supplemental_basis') ORDER BY bd.priority""", (batch_id,)
         )
         basis = self._basis_context(batch_id, basis_rows)
-        self._activity(batch_id, activity=f"准备逐条执行 {len(tasks)} 个独立 LLM 审核任务",
-                       resource=_resource("LLM", settings.llm_base_url, settings.llm_model))
         client = LLMClient(settings)
+        try:
+            resolved_model = client.resolve_model()
+        except Exception as exc:
+            message = str(exc)[:500]
+            self.db.execute(
+                "UPDATE rule_evaluations SET status='调用失败',error=?,completed_at=? WHERE batch_id=?",
+                (message, utcnow(), batch_id),
+            )
+            self._activity(batch_id, activity="无法确定 LLM 模型，所有独立规则任务已停止", resource="LLM 配置")
+            return [*findings, Finding(
+                "待人工确认", "Review", "独立规则审核未执行", message,
+                requirement="配置模型名称，或确保 /models 返回可用模型",
+            )]
+        concurrency = min(len(tasks), max(1, settings.llm_concurrency))
+        llm_resource = _resource("LLM", settings.llm_base_url, resolved_model)
+        mode_label = "自适应审核" if review_mode == "adaptive" else "思考模式深度复核"
+        self._activity(
+            batch_id, activity=f"{mode_label}：准备并发执行 {len(tasks)} 个独立 LLM 审核任务（并发 {concurrency}）",
+            resource=llm_resource,
+        )
         discovered: list[Finding] = []
         failed_tasks: list[str] = []
-        for index, task in enumerate(tasks, 1):
-            self._check_cancel(batch_id)
-            started = utcnow()
-            self.db.execute("UPDATE rule_evaluations SET status='审核中',started_at=?,error='' WHERE batch_id=? AND task_index=?",
-                            (started, batch_id, index))
-            self._activity(
-                batch_id, progress=82 + int(12 * (index - 1) / max(1, len(tasks))),
-                activity=f"LLM 正在独立判断第 {index}/{len(tasks)} 条：{task}",
-                resource=_resource("LLM", settings.llm_base_url, settings.llm_model),
-            )
-            try:
-                task_documents = _rule_evidence_documents(documents, task)
+        started = utcnow()
+        self.db.execute(
+            "UPDATE rule_evaluations SET status='审核中',started_at=?,error='' WHERE batch_id=?",
+            (started, batch_id),
+        )
+
+        def run_task(index: int, task: str) -> tuple[int, str, dict[str, object], Finding | None]:
+            task_documents = _rule_evidence_documents(documents, task, max_chars=8_000)
+            prompt = build_rule_task_prompt(task, task_documents, instructions, findings, basis)
+            if review_mode == "deep":
                 payload = client.generate_json(
-                    build_rule_task_prompt(task, task_documents, instructions, findings, basis),
-                    retries=0, timeout_seconds=90, max_tokens=900,
+                    prompt, retries=0, timeout_seconds=settings.llm_timeout_seconds,
+                    max_tokens=4096, thinking=True,
                 )
-                evaluation, finding = rule_evaluation_from_llm(payload, task, documents)
+            else:
+                # Adaptive mode deliberately performs one compact LLM call per
+                # enabled rule. Unlocatable evidence is downgraded to manual
+                # review locally; it must not trigger two more slow repair calls.
+                quick_prompt = prompt + """
+
+这是自适应审核。不要展开分析，每条规则只调用一次模型。
+只返回紧凑 JSON：{"r":"合格|不合格|存疑|不适用","c":"结论不超过24字","f":"原文件名","p":1,"e":"连续原文不超过60字","t":"source|absence","s":"检查范围不超过40字","q":0.0}
+字段完全缺失时 t 必须为 absence；e 必须逐字复制连续原文，无法定位则判为存疑且留空。"""
+                payload = client.generate_json(
+                    quick_prompt, retries=1, timeout_seconds=min(90, settings.llm_timeout_seconds),
+                    max_tokens=220, thinking=False,
+                )
+            evaluation, finding = rule_evaluation_from_llm(payload, task, documents)
+            return index, task, evaluation, finding
+
+        with ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="audit-rule") as executor:
+            future_tasks = {
+                executor.submit(run_task, index, task): (index, task) for index, task in enumerate(tasks, 1)
+            }
+            for completed, future in enumerate(as_completed(future_tasks), 1):
+                self._check_cancel(batch_id)
+                index, task = future_tasks[future]
+                try:
+                    _, _, evaluation, finding = future.result()
+                except Exception as exc:
+                    failed_tasks.append(task)
+                    message = str(exc)[:500] or type(exc).__name__
+                    LOGGER.warning("独立规则任务失败 %s：%s", task, type(exc).__name__)
+                    self.db.execute(
+                        "UPDATE rule_evaluations SET status='调用失败',error=?,completed_at=? WHERE batch_id=? AND task_index=?",
+                        (message, utcnow(), batch_id, index),
+                    )
+                else:
+                    self.db.execute(
+                        """UPDATE rule_evaluations SET status=?,conclusion=?,source_file=?,source_page=?,evidence=?,evidence_type=?,
+                           actual=?,requirement=?,logic=?,suggestion=?,confidence=?,completed_at=? WHERE batch_id=? AND task_index=?""",
+                        (evaluation["status"], evaluation["conclusion"], evaluation["source_file"], evaluation["source_page"],
+                         evaluation["evidence"], evaluation["evidence_type"], evaluation["actual"], evaluation["requirement"],
+                         evaluation["logic"], evaluation["suggestion"], evaluation["confidence"], utcnow(), batch_id, index),
+                    )
+                    if finding:
+                        discovered.append(finding)
                 self.db.execute(
-                    """UPDATE rule_evaluations SET status=?,conclusion=?,source_file=?,source_page=?,evidence=?,evidence_type=?,
-                       actual=?,requirement=?,logic=?,suggestion=?,confidence=?,completed_at=? WHERE batch_id=? AND task_index=?""",
-                    (evaluation["status"], evaluation["conclusion"], evaluation["source_file"], evaluation["source_page"],
-                     evaluation["evidence"], evaluation["evidence_type"], evaluation["actual"], evaluation["requirement"],
-                     evaluation["logic"], evaluation["suggestion"], evaluation["confidence"], utcnow(), batch_id, index),
+                    "UPDATE jobs SET updated_at=? WHERE batch_id=?", (utcnow(), batch_id)
                 )
-                if finding:
-                    discovered.append(finding)
-            except ReviewCancelled:
-                raise
-            except Exception as exc:
-                failed_tasks.append(task)
-                message = str(exc)[:500] or type(exc).__name__
-                LOGGER.warning("独立规则任务失败 %s：%s", task, type(exc).__name__)
-                self.db.execute("UPDATE rule_evaluations SET status='调用失败',error=?,completed_at=? WHERE batch_id=? AND task_index=?",
-                                (message, utcnow(), batch_id, index))
+                self._activity(
+                    batch_id, progress=82 + int(12 * completed / max(1, len(tasks))),
+                    activity=f"{mode_label}已完成 {completed}/{len(tasks)} 条；刚完成：{task}", resource=llm_resource,
+                )
         if failed_tasks:
             discovered.append(Finding(
                 "待人工确认", "Review", "部分独立规则未完成",
@@ -441,7 +505,7 @@ class ReviewService:
             ))
         self._activity(batch_id, progress=94,
                        activity=f"独立规则审核完成：{len(tasks)-len(failed_tasks)}/{len(tasks)} 条成功，新增 {len(discovered)} 个问题或待复核项",
-                       resource=_resource("LLM", settings.llm_base_url, settings.llm_model))
+                       resource=llm_resource)
         return _dedupe_findings([*findings, *discovered])
 
     def _basis_context(self, batch_id: str, basis_rows: list[dict[str, object]]) -> str:
@@ -522,31 +586,55 @@ class ReviewService:
         client = LLMClient(settings)
         group_size = 20
         groups = [findings[offset:offset + group_size] for offset in range(0, len(findings), group_size)]
-        for group_index, group in enumerate(groups, start=1):
+        try:
+            resolved_model = client.resolve_model()
+        except Exception as exc:
+            LOGGER.warning("LLM 模型识别失败，保留规则结论：%s", exc)
+            self._activity(batch_id, activity=f"LLM 模型不可用，保留规则说明：{exc}", resource="本机规则引擎")
+            return findings
+
+        def explain_group(group_index: int, group: list[Finding]) -> dict:
             offset = (group_index - 1) * group_size
             inputs = [{"index": offset + index, "logic": finding.logic[:500], "actual": finding.actual[:300],
                        "requirement": finding.requirement[:500]} for index, finding in enumerate(group)]
-            self._activity(
-                batch_id, progress=82 + int(14 * (group_index - 1) / max(1, len(groups))),
-                activity=f"正在调用 LLM 批量解释第 {group_index}/{len(groups)} 组（{len(group)} 个问题）",
-                resource=_resource("LLM", settings.llm_base_url, settings.llm_model),
-            )
             prompt = ("你是质量审核解释器。程序规则结论不可更改，不得引用输入以外的标准。"
                       "为每个输入生成简短原因、整改建议和0到1置信度。"
                       f"\n输入：{json.dumps(inputs, ensure_ascii=False)}"
                       "\n返回 JSON：{\"items\":[{\"index\":0,\"reason\":\"...\",\"suggestion\":\"...\",\"confidence\":0.0}]}")
-            try:
-                result = client.generate_json(prompt)
-                for item in result.get("items", []):
-                    index = int(item.get("index", -1))
-                    if not 0 <= index < len(findings):
-                        continue
-                    finding = findings[index]
-                    finding.description = str(item.get("reason") or finding.description)
-                    finding.suggestion = str(item.get("suggestion") or finding.suggestion)
-                    finding.confidence = max(0.0, min(1.0, float(item.get("confidence", finding.confidence))))
-            except Exception as exc:
-                LOGGER.warning("LLM 解释失败，保留规则结论：%s", type(exc).__name__)
+            return client.generate_json(
+                prompt, retries=0, timeout_seconds=settings.llm_timeout_seconds, max_tokens=4096
+            )
+
+        workers = min(len(groups), settings.llm_concurrency)
+        self._activity(
+            batch_id, progress=82,
+            activity=f"正在并发生成问题说明（0/{len(groups)} 组，并发 {workers}）",
+            resource=_resource("LLM", settings.llm_base_url, resolved_model),
+        )
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="qaqc-explain") as executor:
+            futures = {
+                executor.submit(explain_group, group_index, group): group_index
+                for group_index, group in enumerate(groups, start=1)
+            }
+            for completed, future in enumerate(as_completed(futures), start=1):
+                group_index = futures[future]
+                try:
+                    result = future.result()
+                    for item in result.get("items", []):
+                        index = int(item.get("index", -1))
+                        if not 0 <= index < len(findings):
+                            continue
+                        finding = findings[index]
+                        finding.description = str(item.get("reason") or finding.description)
+                        finding.suggestion = str(item.get("suggestion") or finding.suggestion)
+                        finding.confidence = max(0.0, min(1.0, float(item.get("confidence", finding.confidence))))
+                except Exception as exc:
+                    LOGGER.warning("LLM 第 %s 组解释失败，保留规则结论：%s", group_index, type(exc).__name__)
+                self._activity(
+                    batch_id, progress=82 + int(14 * completed / max(1, len(groups))),
+                    activity=f"LLM 并发批量解释已完成 {completed}/{len(groups)} 组",
+                    resource=_resource("LLM", settings.llm_base_url, resolved_model),
+                )
         return findings
 
     def _activity(self, batch_id: str | None, **values: object) -> None:
@@ -610,7 +698,7 @@ def _join_names(names: Iterable[str]) -> str:
 def _uses_fastener_audit(template: dict[str, object]) -> bool:
     """Recognize the established fastener template without depending on one exact display name."""
     name = str(template.get("name") or "").casefold()
-    if "紧固件" in name or "CUSTOMER" in name:
+    if "紧固件" in name:
         return True
     instructions = str(template.get("review_instructions") or "").casefold()
     has_traceability = "wdc" in instructions or "coc" in instructions or "coi" in instructions or "mtr" in instructions

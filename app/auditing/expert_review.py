@@ -9,7 +9,7 @@ from pathlib import Path
 from app.models import Finding, PageText
 
 
-FASTENER_TEMPLATE_NAME = "CUSTOMER 紧固件质量文件审核"
+FASTENER_TEMPLATE_NAME = "通用紧固件质量文件审核"
 FASTENER_REQUIRED_CHECKS = [
     "A1 文件完整性",
     "A2 文件可读性/清晰度",
@@ -26,11 +26,36 @@ FASTENER_REQUIRED_CHECKS = [
     "D2 多供应商/多批次风险",
 ]
 FASTENER_REVIEW_INSTRUCTIONS = """你是维修备件紧固件质量文件审核专家。只依据本次文件和所选审核依据判断，不得引用未提供的标准或臆测。
-CUSTOMER 文件包应包含 COC，以及每个有后续文件的 WDC 对应的 COI/MTR；COI/MTR应包含尺寸、机械性能和化学成分。
+紧固件质量文件包应包含 COC，以及每个有后续文件的 WDC 对应的 COI/MTR；COI/MTR应包含尺寸、机械性能和化学成分。
 逐项检查文件可读性、签字/盖章、日期、出具单位、WDC、产品规格/尺寸/等级/标准、检测数据与结论一致性。
-PO 在此场景仅作识别，不用非 CUSTOMER 格式订单号直接判废；WDC 从文件名或正文识别，去除分隔符后应为 8 或 10 位数字。
+PO 在此场景仅作识别，不用非特定格式订单号直接判废；WDC 从文件名或正文识别，去除分隔符后应为 8 或 10 位数字。
 标准值或实测值缺失、公差写法无法判断、扫描页无法识别时判为存疑。Sample/Pass 数量不相等、实测值超出文件中明确标准但仍宣称合格、印记不一致时判为不合格。
 每个不合格或存疑项必须给出原文件名、页码和可核验的原文/表格证据；没有证据不得下结论。"""
+
+
+def parse_template_tasks(raw: object) -> list[dict[str, object]]:
+    """Read both legacy string lists and editable task rows."""
+    try:
+        values = json.loads(str(raw or "[]")) if not isinstance(raw, list) else raw
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return []
+    output: list[dict[str, object]] = []
+    if not isinstance(values, list):
+        return output
+    for value in values:
+        if isinstance(value, dict):
+            text = str(value.get("text") or value.get("item") or "").strip()
+            enabled = bool(value.get("enabled", True))
+        else:
+            text = str(value).strip()
+            enabled = True
+        if text:
+            output.append({"text": text, "enabled": enabled})
+    return output
+
+
+def enabled_template_tasks(raw: object) -> list[str]:
+    return [str(row["text"]) for row in parse_template_tasks(raw) if row["enabled"]]
 
 
 @dataclass(frozen=True)
@@ -51,7 +76,7 @@ def deterministic_fastener_audit(documents: list[ExpertDocument]) -> list[Findin
     filenames = "；".join(document.filename for document in documents) or "未提供文件"
     if "COC" not in types:
         findings.append(Finding(
-            "文件缺失", "Major", "A1 文件完整性", "CUSTOMER 文件包中未识别到 COC。",
+            "文件缺失", "Major", "A1 文件完整性", "紧固件质量文件包中未识别到 COC。",
             actual=f"批次文件清单：{filenames}", requirement="必须包含 COC 及各 WDC 对应的 COI/MTR",
             source_file=documents[0].filename if documents else "", source_page=1,
             source_text=f"批次文件清单：{filenames}", logic="已识别文件类型中不包含 COC",
@@ -130,7 +155,7 @@ def build_rule_task_prompt(
     task: str, documents: list[ExpertDocument], instructions: str, existing: Iterable[Finding], basis: str = ""
 ) -> str:
     evidence_blocks = []
-    remaining = 16_000
+    remaining = 9_000
     for document in documents:
         for page in document.pages:
             block = f"[文件={document.filename}][页={page.page}]\n{page.text.strip()}"
@@ -151,10 +176,10 @@ def build_rule_task_prompt(
 {instructions or FASTENER_FALLBACK_INSTRUCTIONS}
 
 所选审核依据：
-{basis[:6_000] or "未提供额外标准，不得自行补充标准值"}
+{basis[:3_000] or "未提供额外标准，不得自行补充标准值"}
 
 本地规则已发现内容（仅用于避免矛盾）：
-{json.dumps(known, ensure_ascii=False)}
+{json.dumps(known, ensure_ascii=False)[:3_000]}
 
 本批次文件清单：{json.dumps([item.filename for item in documents], ensure_ascii=False)}
 
@@ -173,31 +198,43 @@ def build_rule_task_prompt(
 def rule_evaluation_from_llm(
     payload: dict[str, object], task: str, documents: list[ExpertDocument]
 ) -> tuple[dict[str, object], Finding | None]:
-    result = str(payload.get("result") or "").strip()
+    # The adaptive path uses compact keys to reduce local-model generation time.
+    # Full-key payloads remain supported for deep mode and compatibility.
+    result = str(payload.get("result") or payload.get("r") or "").strip()
     if result not in {"合格", "不合格", "存疑", "不适用"}:
         raise ValueError("独立规则结果必须是合格、不合格、存疑或不适用")
-    filename = str(payload.get("source_file") or "").strip()
+    filename = str(payload.get("source_file") or payload.get("f") or "").strip()
     try:
-        page = int(payload.get("page") or 0)
+        page = int(payload.get("page") or payload.get("p") or 0)
     except (TypeError, ValueError):
         page = 0
-    evidence = str(payload.get("evidence") or "").strip()
-    evidence_type = str(payload.get("evidence_type") or "source").strip()
-    checked_scope = str(payload.get("checked_scope") or "").strip()
+    evidence = str(payload.get("evidence") or payload.get("e") or "").strip()
+    evidence_type = str(payload.get("evidence_type") or payload.get("t") or "source").strip()
+    checked_scope = str(payload.get("checked_scope") or payload.get("s") or "").strip()
     page_lookup = {(document.filename, item.page): item.text for document in documents for item in document.pages}
     if result in {"不合格", "存疑"}:
         if evidence_type == "absence":
             if not checked_scope:
-                raise ValueError("缺失类结论必须提供检查范围")
-            evidence = checked_scope
-            if not filename and documents:
-                filename = documents[0].filename
-            page = page or 1
+                evidence_type = "unlocated"
+                evidence = ""
+            else:
+                evidence = checked_scope
         elif not filename or page <= 0 or not evidence or not _evidence_present(evidence, page_lookup.get((filename, page), "")):
-            raise ValueError("不合格或存疑结论缺少可核验的原页证据")
-    confidence = _confidence(payload.get("confidence"))
+            # Never publish fabricated evidence. Keep the model's signal as a
+            # manual-review item without a red box instead of spending another
+            # LLM call trying to repair a quote.
+            result = "存疑"
+            evidence_type = "unlocated"
+            evidence = ""
+        if not filename and documents:
+            filename = documents[0].filename
+        page = page or 1
+    confidence = _confidence(payload.get("confidence") if "confidence" in payload else payload.get("q"))
+    conclusion = str(payload.get("conclusion") or payload.get("c") or "")
+    if evidence_type == "unlocated":
+        conclusion = (conclusion or "模型发现疑点") + "（证据未能自动定位，需人工复核）"
     evaluation = {
-        "task_name": task, "status": result, "conclusion": str(payload.get("conclusion") or ""),
+        "task_name": task, "status": result, "conclusion": conclusion,
         "source_file": filename, "source_page": page, "evidence": evidence, "evidence_type": evidence_type,
         "actual": str(payload.get("actual") or ""), "requirement": str(payload.get("requirement") or ""),
         "logic": str(payload.get("logic") or ""), "suggestion": str(payload.get("suggestion") or ""),
@@ -207,7 +244,7 @@ def rule_evaluation_from_llm(
         return evaluation, None
     finding = Finding(
         "独立规则复核", "Major" if result == "不合格" else "Review", task,
-        str(payload.get("conclusion") or f"独立规则判断为{result}"),
+        conclusion or f"独立规则判断为{result}",
         evaluation["actual"], evaluation["requirement"], filename, page or 1, evidence,
         logic=evaluation["logic"], suggestion=evaluation["suggestion"] or "请人工复核并要求供应商补充证据。",
         confidence=confidence, metadata={"origin": "llm_rule_task", "result": result, "evidence_type": evidence_type},

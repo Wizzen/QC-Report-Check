@@ -3,6 +3,7 @@ from __future__ import annotations
 from io import BytesIO
 import json
 from pathlib import Path
+from threading import Barrier
 from unittest.mock import patch
 
 import pymupdf
@@ -52,6 +53,31 @@ def test_review_requires_supplier_file_before_creating_batch(tmp_path: Path) -> 
         service.create_review(None, [], [], [])
 
     assert service.db.one("SELECT COUNT(*) count FROM review_batches")["count"] == 0
+
+
+def test_each_upload_creates_an_independent_event_and_document_copy(tmp_path: Path) -> None:
+    service = _service(tmp_path)
+    template_id = service.db.one("SELECT id FROM audit_templates WHERE is_default=1")["id"]
+
+    first_batch = service.create_review(template_id, [], [_pdf("Report No R-1", "same-name.pdf")], [])
+    second_batch = service.create_review(template_id, [], [_pdf("Report No R-2", "same-name.pdf")], [])
+
+    assert first_batch != second_batch
+    first_document = service.db.one(
+        "SELECT d.id,d.stored_path FROM batch_documents bd JOIN documents d ON d.id=bd.document_id WHERE bd.batch_id=?",
+        (first_batch,),
+    )
+    second_document = service.db.one(
+        "SELECT d.id,d.stored_path FROM batch_documents bd JOIN documents d ON d.id=bd.document_id WHERE bd.batch_id=?",
+        (second_batch,),
+    )
+    assert first_document["id"] != second_document["id"]
+    assert first_document["stored_path"] != second_document["stored_path"]
+    assert first_batch in first_document["stored_path"]
+    assert second_batch in second_document["stored_path"]
+    assert service.db.one("SELECT template_snapshot FROM review_batches WHERE id=?", (first_batch,))["template_snapshot"]
+    assert service.db.one("SELECT template_snapshot FROM review_batches WHERE id=?", (second_batch,))["template_snapshot"]
+    assert service.db.one("SELECT review_mode FROM review_batches WHERE id=?", (first_batch,))["review_mode"] == "adaptive"
 
 
 def test_full_local_rule_path_uses_basis_not_supplier_archive(tmp_path: Path) -> None:
@@ -173,7 +199,7 @@ def test_each_template_item_calls_llm_once_and_is_aggregated(tmp_path: Path) -> 
            enabled,is_default,created_at) VALUES(?,?,?,?,?,1,0,datetime('now'))""",
         ("逐条模板", "", "[]", json.dumps(tasks, ensure_ascii=False), "只依据原文"),
     )
-    batch_id = service.db.create_batch(template_id)
+    batch_id = service.db.create_batch(template_id, "deep")
     document_id = service.db.add_document(
         library="supplier", kind="supplier", original_name="MTR.pdf",
         stored_path=str(tmp_path / "MTR.pdf"), sha256="independent-rules",
@@ -201,6 +227,115 @@ def test_each_template_item_calls_llm_once_and_is_aggregated(tmp_path: Path) -> 
     assert [(row["task_name"], row["status"]) for row in evaluations] == [
         (tasks[0], "合格"), (tasks[1], "不适用"), (tasks[2], "存疑")]
     assert [finding.item for finding in findings] == ["检查报告编号"]
+
+
+def test_template_rule_tasks_are_submitted_concurrently(tmp_path: Path) -> None:
+    service = _service(tmp_path)
+    service.config_store.save({"llm_model": "test-model", "llm_concurrency": 3})
+    tasks = ["任务一", "任务二", "任务三"]
+    template_id = service.db.execute(
+        """INSERT INTO audit_templates(name,description,required_document_types,required_items,review_instructions,
+           enabled,is_default,created_at) VALUES(?,?,?,?,?,1,0,datetime('now'))""",
+        ("并发模板", "", "[]", json.dumps(tasks, ensure_ascii=False), "只依据原文"),
+    )
+    batch_id = service.db.create_batch(template_id)
+    document_id = service.db.add_document(
+        library="supplier", kind="supplier", original_name="MTR.pdf",
+        stored_path=str(tmp_path / "MTR.pdf"), sha256="parallel-rules",
+    )
+    service.db.execute(
+        "UPDATE documents SET page_text=?,parse_status='completed' WHERE id=?",
+        (json.dumps([{"page": 1, "text": "Inspection Report"}], ensure_ascii=False), document_id),
+    )
+    service.db.attach_document(batch_id, document_id, "supplier", 4)
+    rendezvous = Barrier(3)
+
+    def concurrent_response(*_args, **_kwargs):
+        rendezvous.wait(timeout=2)
+        return {"result": "不适用", "conclusion": "测试完成", "confidence": 0.9}
+
+    with patch("app.auditing.v2_service.LLMClient.generate_json", side_effect=concurrent_response) as generate:
+        service._expert_review(batch_id, [])
+
+    assert generate.call_count == 3
+    assert all(call.kwargs["timeout_seconds"] == 90 for call in generate.call_args_list)
+    assert all(call.kwargs["max_tokens"] == 220 for call in generate.call_args_list)
+    assert all(call.kwargs["retries"] == 1 for call in generate.call_args_list)
+    assert all(call.kwargs["thinking"] is False for call in generate.call_args_list)
+    assert [row["status"] for row in service.db.query(
+        "SELECT status FROM rule_evaluations WHERE batch_id=? ORDER BY task_index", (batch_id,))] == [
+            "不适用", "不适用", "不适用"]
+
+
+def test_adaptive_mode_calls_each_rule_once_and_downgrades_unlocated_evidence(tmp_path: Path) -> None:
+    service = _service(tmp_path)
+    service.config_store.save({"llm_model": "qwen3.5-test", "llm_concurrency": 2})
+    template_id = service.db.execute(
+        """INSERT INTO audit_templates(name,description,required_document_types,required_items,review_instructions,
+           enabled,is_default,created_at) VALUES(?,?,?,?,?,1,0,datetime('now'))""",
+        ("自适应模板", "", "[]", json.dumps(["检查报告编号"], ensure_ascii=False), "只依据原文"),
+    )
+    batch_id = service.db.create_batch(template_id, "adaptive")
+    document_id = service.db.add_document(
+        library="supplier", kind="supplier", original_name="MTR.pdf",
+        stored_path=str(tmp_path / "MTR.pdf"), sha256="adaptive-mode",
+    )
+    service.db.execute(
+        "UPDATE documents SET page_text=?,parse_status='completed' WHERE id=?",
+        (json.dumps([{"page": 1, "text": "Report No: R456"}], ensure_ascii=False), document_id),
+    )
+    service.db.attach_document(batch_id, document_id, "supplier", 4)
+    response = {"r": "不合格", "c": "需要复核", "f": "MTR.pdf", "p": 1,
+                "e": "模型转述而非原页逐字证据", "q": 0.8}
+
+    with patch("app.auditing.v2_service.LLMClient.generate_json", return_value=response) as generate:
+        findings = service._expert_review(batch_id, [])
+
+    assert len(findings) == 1
+    assert findings[0].severity == "Review"
+    assert findings[0].source_text == ""
+    assert findings[0].metadata["evidence_type"] == "unlocated"
+    assert generate.call_count == 1
+    assert generate.call_args.kwargs == {
+        "retries": 1, "timeout_seconds": 90, "max_tokens": 220, "thinking": False,
+    }
+    assert "每条规则只调用一次模型" in generate.call_args.args[0]
+    assert service.db.one(
+        "SELECT status FROM rule_evaluations WHERE batch_id=?", (batch_id,)
+    )["status"] == "存疑"
+
+
+def test_batch_uses_template_snapshot_after_template_is_edited(tmp_path: Path) -> None:
+    service = _service(tmp_path)
+    service.config_store.save({"llm_model": "test-model", "llm_concurrency": 2})
+    template_id = service.db.execute(
+        """INSERT INTO audit_templates(name,description,required_document_types,required_items,review_instructions,
+           enabled,is_default,created_at) VALUES(?,?,?,?,?,1,0,datetime('now'))""",
+        ("快照模板", "", "[]", json.dumps(["上传时任务A", "上传时任务B"], ensure_ascii=False), "上传时说明"),
+    )
+    batch_id = service.db.create_batch(template_id)
+    service.db.execute(
+        "UPDATE audit_templates SET required_items=?,review_instructions=? WHERE id=?",
+        (json.dumps(["后来任务"], ensure_ascii=False), "后来说明", template_id),
+    )
+    document_id = service.db.add_document(
+        library="supplier", kind="supplier", original_name="MTR.pdf",
+        stored_path=str(tmp_path / "MTR.pdf"), sha256="snapshot-rules",
+    )
+    service.db.execute(
+        "UPDATE documents SET page_text=?,parse_status='completed' WHERE id=?",
+        (json.dumps([{"page": 1, "text": "Inspection Report"}], ensure_ascii=False), document_id),
+    )
+    service.db.attach_document(batch_id, document_id, "supplier", 4)
+
+    with patch("app.auditing.v2_service.LLMClient.generate_json",
+               return_value={"result": "不适用", "conclusion": "完成"}) as generate:
+        service._expert_review(batch_id, [])
+
+    assert generate.call_count == 2
+    assert [row["task_name"] for row in service.db.query(
+        "SELECT task_name FROM rule_evaluations WHERE batch_id=? ORDER BY task_index", (batch_id,))] == [
+            "上传时任务A", "上传时任务B"]
 
 
 def test_one_failed_rule_does_not_stop_later_rules(tmp_path: Path) -> None:
