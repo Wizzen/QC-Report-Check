@@ -19,6 +19,7 @@ logs/*
 !logs/.gitkeep
 .app.pid
 .app-pids.json
+.worker-status.json
 data/secrets/
 tmp/
 output/

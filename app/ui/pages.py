@@ -11,6 +11,7 @@ import pandas as pd
 import streamlit as st
 
 from app.exporters import export_batch, export_batch_pdf
+from app.config import ROOT
 from app.integrations import LLMClient, MinerUClient
 from app.integrations.settings import mask_secret
 from app.ui.context import get_context
@@ -126,6 +127,18 @@ def review_records_page() -> None:
            (SELECT COUNT(*) FROM findings f WHERE f.batch_id=b.id AND f.severity='Review' AND f.status='AI发现') review_count
            FROM review_batches b LEFT JOIN audit_templates t ON t.id=b.template_id ORDER BY b.created_at DESC"""
     )
+    all_tasks = ctx.db.query(
+        """SELECT j.id,j.batch_id,j.status job_status,j.attempts,j.locked_at,j.error job_error,
+                  j.created_at,j.updated_at,b.name,b.status batch_status,b.stage,b.progress,b.activity,
+                  b.resource,b.heartbeat_at,b.supplier_name,b.deleted_at,t.name template_name
+           FROM jobs j JOIN review_batches b ON b.id=j.batch_id
+           LEFT JOIN audit_templates t ON t.id=b.template_id ORDER BY j.created_at DESC"""
+    )
+    selected_task_batch = _render_all_tasks_dashboard(all_tasks)
+    if selected_task_batch:
+        selected_task = next(row for row in all_tasks if str(row["batch_id"]) == selected_task_batch)
+        st.session_state["record_batch"] = selected_task_batch
+        st.session_state["review_scope"] = "回收站" if selected_task.get("deleted_at") else "当前审核"
     active_rows = [row for row in all_batches if not row.get("deleted_at")]
     dashboard_filter = str(st.session_state.get("review_dashboard_filter") or "all")
     totals = {
@@ -188,10 +201,10 @@ def review_records_page() -> None:
                              column_config={"问题": st.column_config.NumberColumn(format="%d"),
                                             "严重/主要": st.column_config.NumberColumn(format="%d"),
                                             "待复核": st.column_config.NumberColumn(format="%d")})
-    preferred = str(st.query_params.get("batch") or st.session_state.get("record_batch") or "")
+    preferred = str(selected_task_batch or st.query_params.get("batch") or st.session_state.get("record_batch") or "")
     if event.selection.rows:
         batch_id = str(visible_batches[event.selection.rows[0]]["id"])
-    elif any(str(row["id"]) == preferred and row["status"] == "completed" for row in visible_batches):
+    elif any(str(row["id"]) == preferred for row in visible_batches):
         batch_id = preferred
     else:
         batch_id = str(next((row for row in visible_batches if row["status"] == "completed"), visible_batches[0])["id"])
@@ -219,6 +232,74 @@ def review_records_page() -> None:
     elif detail_view == "文件": _render_batch_files(batch_id)
     elif detail_view == "处理过程": _render_job_events(batch_id)
     else: _render_exports(batch_id)
+
+
+def _render_all_tasks_dashboard(tasks: list[dict[str, object]]) -> str:
+    """Render every persistent queue task and return the selected batch id."""
+    status_path = ROOT / ".worker-status.json"
+    try:
+        worker = json.loads(status_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        worker = {"status": "unknown", "message": "尚未收到 worker 状态"}
+    if worker.get("updated_at") and _heartbeat_age(str(worker["updated_at"])) > 10:
+        worker["status"] = "stale"
+        worker["message"] = "worker 状态超过10秒未更新，启动器可能已经退出"
+    status_labels = {"online": "在线", "restarting": "正在恢复", "failed": "异常", "stopped": "已停止",
+                     "stale": "失联", "unknown": "未知"}
+    worker_label = status_labels.get(str(worker.get("status")), str(worker.get("status") or "未知"))
+    queued = sum(row["job_status"] == "queued" for row in tasks)
+    running = sum(row["job_status"] in {"running", "cancel_requested"} for row in tasks)
+    completed = sum(row["job_status"] == "completed" for row in tasks)
+    abnormal = sum(row["job_status"] in {"failed", "cancelled"} for row in tasks)
+    with st.container(border=True):
+        st.markdown("**全部任务 Dashboard**")
+        with st.container(horizontal=True):
+            st.metric("任务总数", len(tasks), border=True)
+            st.metric("排队", queued, border=True)
+            st.metric("运行中", running, border=True)
+            st.metric("已完成", completed, border=True)
+            st.metric("失败/取消", abnormal, border=True)
+            st.metric("本地 worker", worker_label, border=True)
+        worker_message = str(worker.get("message") or "")
+        if worker.get("status") in {"failed", "restarting", "stopped", "stale", "unknown"}:
+            st.warning(
+                f"worker：{worker_label}。{worker_message or '排队任务暂时无法领取。'}",
+                icon=":material/build_circle:",
+            )
+        elif queued and any(_heartbeat_age(str(row.get("updated_at") or "")) >= 15 for row in tasks if row["job_status"] == "queued"):
+            st.warning(
+                "存在等待超过15秒仍未被领取的任务。worker 虽显示在线，但队列可能异常，请查看任务的尝试次数和 logs/worker.log。",
+                icon=":material/hourglass_disabled:",
+            )
+        elif queued:
+            st.caption(f"worker 在线，当前还有 {queued} 个任务等待领取；状态每秒更新。")
+        elif int(worker.get("restart_count") or 0) > 0:
+            st.caption(f"worker 在线，本次启动已自动恢复 {worker['restart_count']} 次。{worker_message}")
+        else:
+            st.caption("worker 在线，SQLite 本地任务队列运行正常。")
+        if not tasks:
+            st.info("当前还没有任务。")
+            return ""
+        frame = pd.DataFrame([{
+            "任务": str(row["id"])[:8], "批次": row["name"], "供应商": row.get("supplier_name") or "未识别",
+            "队列状态": _status_label(str(row["job_status"])), "批次状态": _status_label(str(row["batch_status"])),
+            "阶段": row["stage"], "进度": int(row["progress"] or 0), "当前操作": row["activity"],
+            "调用资源": row["resource"], "尝试次数": int(row["attempts"] or 0), "最近更新": row["updated_at"],
+            "失败原因": row["job_error"],
+        } for row in tasks])
+        event = st.dataframe(
+            frame, hide_index=True, width="stretch", on_select="rerun", selection_mode="single-row",
+            key="all_job_dashboard_table",
+            column_config={
+                "批次": st.column_config.TextColumn(pinned=True),
+                "进度": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%d%%"),
+                "尝试次数": st.column_config.NumberColumn(format="%d"),
+            },
+        )
+        st.caption("点击任一任务，下面的审核批次表和详情会同步定位到对应批次。")
+    if event.selection.rows:
+        return str(tasks[event.selection.rows[0]]["batch_id"])
+    return ""
 
 
 @st.dialog("确认删除审核记录")

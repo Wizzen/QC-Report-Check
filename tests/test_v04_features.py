@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from app.database import ReviewDatabase
+import launcher
 
 
 def test_withdrawn_versioned_rule_tables_are_removed(tmp_path: Path) -> None:
@@ -18,6 +19,21 @@ def test_windows_launcher_does_not_require_removed_vector_dependency() -> None:
     launcher = (Path(__file__).parents[1] / "start.bat").read_text(encoding="utf-8")
 
     assert "chromadb" not in launcher.casefold()
+
+
+def test_launcher_writes_visible_worker_runtime_status(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    status_path = tmp_path / ".worker-status.json"
+    monkeypatch.setattr(launcher, "WORKER_STATUS_FILE", status_path)
+
+    launcher._write_worker_status(
+        "restarting", pid=1234, restart_count=2, last_exit_code=1,
+        message="worker 已退出，启动器正在自动恢复",
+    )
+
+    payload = status_path.read_text(encoding="utf-8")
+    assert '"status": "restarting"' in payload
+    assert '"restart_count": 2' in payload
+    assert "自动恢复" in payload
 
 
 def test_cancel_queued_job_is_immediate(tmp_path: Path) -> None:
