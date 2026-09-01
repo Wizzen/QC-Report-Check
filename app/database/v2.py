@@ -4,6 +4,7 @@ import json
 import sqlite3
 import shutil
 import uuid
+import hashlib
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -101,6 +102,7 @@ CREATE TABLE IF NOT EXISTS findings (
 CREATE TABLE IF NOT EXISTS review_history (
   id INTEGER PRIMARY KEY AUTOINCREMENT, finding_id INTEGER NOT NULL,
   old_status TEXT NOT NULL, new_status TEXT NOT NULL, note TEXT NOT NULL DEFAULT '', changed_at TEXT NOT NULL,
+  old_severity TEXT NOT NULL DEFAULT '', new_severity TEXT NOT NULL DEFAULT '',
   FOREIGN KEY(finding_id) REFERENCES findings(id) ON DELETE CASCADE
 );
 CREATE TABLE IF NOT EXISTS service_config (
@@ -158,6 +160,23 @@ CREATE TABLE IF NOT EXISTS review_feedback (
   FOREIGN KEY(finding_id) REFERENCES findings(id) ON DELETE CASCADE,
   FOREIGN KEY(batch_id) REFERENCES review_batches(id) ON DELETE CASCADE
 );
+CREATE TABLE IF NOT EXISTS learning_feedback (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  batch_fingerprint TEXT NOT NULL DEFAULT '', finding_fingerprint TEXT NOT NULL DEFAULT '',
+  template_key TEXT NOT NULL DEFAULT '', task_key TEXT NOT NULL DEFAULT '',
+  rule_code TEXT NOT NULL DEFAULT '', document_type TEXT NOT NULL DEFAULT '',
+  action TEXT NOT NULL, reason_code TEXT NOT NULL DEFAULT '', corrected_status TEXT NOT NULL DEFAULT '',
+  corrected_severity TEXT NOT NULL DEFAULT '', evidence_fingerprint TEXT NOT NULL DEFAULT '',
+  model_fingerprint TEXT NOT NULL DEFAULT '', active INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_learning_policy ON learning_feedback(
+  template_key,rule_code,document_type,model_fingerprint,active
+);
+CREATE INDEX IF NOT EXISTS idx_learning_batch ON learning_feedback(batch_fingerprint);
+CREATE TABLE IF NOT EXISTS feedback_pattern_state (
+  pattern_key TEXT PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 1, updated_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS job_events (
   id INTEGER PRIMARY KEY AUTOINCREMENT, batch_id TEXT NOT NULL, stage TEXT NOT NULL,
   activity TEXT NOT NULL, resource TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
@@ -170,6 +189,7 @@ CREATE TABLE IF NOT EXISTS rule_evaluations (
   evidence TEXT NOT NULL DEFAULT '', evidence_type TEXT NOT NULL DEFAULT 'source',
   actual TEXT NOT NULL DEFAULT '', requirement TEXT NOT NULL DEFAULT '', logic TEXT NOT NULL DEFAULT '',
   suggestion TEXT NOT NULL DEFAULT '', confidence REAL NOT NULL DEFAULT 0, error TEXT NOT NULL DEFAULT '',
+  metadata TEXT NOT NULL DEFAULT '{}',
   started_at TEXT NOT NULL DEFAULT '', completed_at TEXT NOT NULL DEFAULT '',
   UNIQUE(batch_id,task_index), FOREIGN KEY(batch_id) REFERENCES review_batches(id) ON DELETE CASCADE
 );
@@ -184,6 +204,7 @@ class ReviewDatabase:
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._backup_before_v04()
+        self._backup_before_v06()
         self.initialize()
 
     def _backup_before_v04(self) -> None:
@@ -199,6 +220,14 @@ class ReviewDatabase:
                 shutil.copy2(self.path, backup)
         except sqlite3.DatabaseError:
             return
+
+    def _backup_before_v06(self) -> None:
+        """Make a one-time byte-for-byte safety copy before feedback migration."""
+        if not self.path.is_file():
+            return
+        backup = self.path.with_suffix(self.path.suffix + ".pre-v0.6.0.bak")
+        if not backup.exists():
+            shutil.copy2(self.path, backup)
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
@@ -268,6 +297,22 @@ class ReviewDatabase:
             }.items():
                 if name not in service_columns:
                     connection.execute(f"ALTER TABLE service_config ADD COLUMN {name} {declaration}")
+            feedback_columns = {row[1] for row in connection.execute("PRAGMA table_info(review_feedback)").fetchall()}
+            for name, declaration in {
+                "reason_code": "TEXT NOT NULL DEFAULT ''",
+                "corrected_status": "TEXT NOT NULL DEFAULT ''",
+                "corrected_severity": "TEXT NOT NULL DEFAULT ''",
+                "undone_at": "TEXT NOT NULL DEFAULT ''",
+            }.items():
+                if name not in feedback_columns:
+                    connection.execute(f"ALTER TABLE review_feedback ADD COLUMN {name} {declaration}")
+            evaluation_columns = {row[1] for row in connection.execute("PRAGMA table_info(rule_evaluations)").fetchall()}
+            if "metadata" not in evaluation_columns:
+                connection.execute("ALTER TABLE rule_evaluations ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}'")
+            history_columns = {row[1] for row in connection.execute("PRAGMA table_info(review_history)").fetchall()}
+            for name in ("old_severity", "new_severity"):
+                if name not in history_columns:
+                    connection.execute(f"ALTER TABLE review_history ADD COLUMN {name} TEXT NOT NULL DEFAULT ''")
             connection.executemany(
                 "INSERT OR IGNORE INTO document_libraries(code,name,description) VALUES(?,?,?)",
                 [
@@ -361,21 +406,207 @@ class ReviewDatabase:
 
     def update_finding_status(self, finding_id: int, new_status: str, note: str = "",
                               correction: str = "", evidence: str = "", service_fingerprint: str = "") -> None:
-        row = self.one("SELECT status,batch_id FROM findings WHERE id=?", (finding_id,))
+        self.record_finding_feedback(
+            finding_id, action=new_status, new_status=new_status, correction=correction,
+            evidence=evidence, note=note, service_fingerprint=service_fingerprint,
+            learning_eligible=False,
+        )
+
+    def record_finding_feedback(
+        self, finding_id: int, *, action: str, new_status: str | None = None,
+        reason_code: str = "", corrected_status: str = "", corrected_severity: str = "",
+        correction: str = "", evidence: str = "", note: str = "",
+        service_fingerprint: str = "", learning_eligible: bool = True,
+    ) -> int:
+        """Record an auditable action and a raw-text-free local learning sample."""
+        row = self.one(
+            """SELECT f.*,b.template_snapshot,b.template_id FROM findings f
+               JOIN review_batches b ON b.id=f.batch_id WHERE f.id=?""", (finding_id,),
+        )
         if not row:
             raise ValueError("问题不存在")
+        target_status = new_status or corrected_status or row["status"]
+        if action == "误报驳回" and not reason_code:
+            raise ValueError("误报驳回必须选择原因")
+        if action == "修正结论" and (not corrected_status or not corrected_severity or not (correction or evidence)):
+            raise ValueError("修正结论必须填写正确状态、严重程度和依据")
+        try:
+            template_snapshot = json.loads(row.get("template_snapshot") or "{}")
+        except (TypeError, ValueError):
+            template_snapshot = {}
+        template_key = str(template_snapshot.get("name") or row.get("template_id") or "")
+        task_key = str(row.get("item") or "")
+        document_type = str(row.get("document_type") or "") or self._document_type_for_finding(row)
+        now = utcnow()
         with self.connect() as connection:
-            connection.execute("UPDATE findings SET status=? WHERE id=?", (new_status, finding_id))
             connection.execute(
-                "INSERT INTO review_history(finding_id,old_status,new_status,note,changed_at) VALUES(?,?,?,?,?)",
-                (finding_id, row["status"], new_status, note, utcnow()),
+                "UPDATE findings SET status=?,severity=CASE WHEN ?<>'' THEN ? ELSE severity END WHERE id=?",
+                (target_status, corrected_severity, corrected_severity, finding_id),
             )
             connection.execute(
+                """INSERT INTO review_history(finding_id,old_status,new_status,note,changed_at,old_severity,new_severity)
+                   VALUES(?,?,?,?,?,?,?)""",
+                (finding_id, row["status"], target_status, note or action, now, row["severity"],
+                 corrected_severity or row["severity"]),
+            )
+            cursor = connection.execute(
                 """INSERT INTO review_feedback(finding_id,batch_id,action,correction,evidence,note,
-                   service_fingerprint,created_at) VALUES(?,?,?,?,?,?,?,?)""",
-                (finding_id, row["batch_id"], new_status, correction, evidence, note,
-                 service_fingerprint, utcnow()),
+                   service_fingerprint,created_at,reason_code,corrected_status,corrected_severity)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                (finding_id, row["batch_id"], action, correction, evidence, note,
+                 service_fingerprint, now, reason_code, corrected_status, corrected_severity),
             )
+            if learning_eligible and action in {"确认问题", "误报驳回", "修正结论", "补充漏检问题"}:
+                connection.execute(
+                    """INSERT INTO learning_feedback(batch_fingerprint,finding_fingerprint,template_key,task_key,
+                       rule_code,document_type,action,reason_code,corrected_status,corrected_severity,
+                       evidence_fingerprint,model_fingerprint,created_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (_fingerprint(row["batch_id"]), _fingerprint(str(finding_id)), template_key, task_key,
+                     str(row.get("rule_code") or task_key), document_type, action, reason_code, corrected_status,
+                     corrected_severity, _fingerprint(evidence or correction), service_fingerprint, now),
+                )
+            return int(cursor.lastrowid)
+
+    def add_manual_finding(
+        self, batch_id: str, *, item: str, description: str, severity: str,
+        source_file: str, source_page: int, evidence: str, requirement: str = "",
+        note: str = "", document_type: str = "", service_fingerprint: str = "",
+    ) -> int:
+        if not item or not source_file or int(source_page or 0) < 1 or not evidence:
+            raise ValueError("补充漏检问题必须指定问题、文件、页码和证据")
+        now = utcnow()
+        finding_id = self.execute(
+            """INSERT INTO findings(batch_id,category,severity,item,description,requirement,source_file,
+               source_page,source_text,logic,suggestion,confidence,status,metadata,document_type,created_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (batch_id, "人工补充", severity, item, description, requirement, source_file, source_page,
+             evidence, "人工依据原文补充的漏检问题", "请按人工确认结论处理。", 1.0, "人工确认",
+             json.dumps({"origin": "manual", "evidence_type": "source"}, ensure_ascii=False), document_type, now),
+        )
+        self.record_finding_feedback(
+            finding_id, action="补充漏检问题", new_status="人工确认", correction=description,
+            evidence=evidence, note=note, service_fingerprint=service_fingerprint,
+        )
+        return finding_id
+
+    def undo_last_feedback(self, finding_id: int) -> bool:
+        row = self.one(
+            """SELECT h.id,h.old_status,h.old_severity,f.status current_status,f.severity current_severity,f.batch_id
+               FROM review_history h JOIN findings f ON f.id=h.finding_id
+               WHERE h.finding_id=? ORDER BY h.id DESC LIMIT 1""", (finding_id,),
+        )
+        if not row:
+            return False
+        now = utcnow()
+        with self.connect() as connection:
+            connection.execute(
+                "UPDATE findings SET status=?,severity=CASE WHEN ?<>'' THEN ? ELSE severity END WHERE id=?",
+                (row["old_status"], row["old_severity"], row["old_severity"], finding_id),
+            )
+            connection.execute(
+                """INSERT INTO review_history(finding_id,old_status,new_status,note,changed_at,old_severity,new_severity)
+                   VALUES(?,?,?,?,?,?,?)""",
+                (finding_id, row["current_status"], row["old_status"], "撤销上次人工操作", now,
+                 row["current_severity"], row["old_severity"] or row["current_severity"]),
+            )
+            feedback = connection.execute(
+                "SELECT id FROM review_feedback WHERE finding_id=? AND undone_at='' ORDER BY id DESC LIMIT 1",
+                (finding_id,),
+            ).fetchone()
+            if feedback:
+                connection.execute("UPDATE review_feedback SET undone_at=? WHERE id=?", (now, feedback["id"]))
+            connection.execute(
+                """UPDATE learning_feedback SET active=0 WHERE id=(SELECT id FROM learning_feedback
+                   WHERE finding_fingerprint=? AND active=1 ORDER BY id DESC LIMIT 1)""",
+                (_fingerprint(str(finding_id)),),
+            )
+        return True
+
+    def feedback_policy_for(self, *, template_key: str, rule_code: str, document_type: str,
+                            model_fingerprint: str = "") -> dict[str, Any]:
+        rows = self.query(
+            """SELECT action,COUNT(*) count FROM learning_feedback WHERE active=1
+               AND template_key=? AND rule_code=? AND document_type=? AND model_fingerprint=?
+               GROUP BY action""", (template_key, rule_code, document_type, model_fingerprint),
+        )
+        counts = {row["action"]: int(row["count"]) for row in rows}
+        total = sum(counts.values())
+        rejected = counts.get("误报驳回", 0)
+        confirmed = counts.get("确认问题", 0) + counts.get("补充漏检问题", 0)
+        key = _policy_key(template_key, rule_code, document_type, model_fingerprint)
+        state = self.one("SELECT enabled FROM feedback_pattern_state WHERE pattern_key=?", (key,))
+        enabled = state is None or bool(state["enabled"])
+        return {
+            "sample_count": total, "rejection_rate": rejected / total if total else 0.0,
+            "confirmation_rate": confirmed / total if total else 0.0,
+            "remaining": max(0, 5 - total), "enabled": enabled,
+            "downgrade_llm_issue": enabled and total >= 5 and rejected / total >= 0.8,
+            "prioritize_review": enabled and total >= 5 and confirmed / total >= 0.8,
+            "pattern_key": key,
+        }
+
+    def learning_summary(self) -> dict[str, Any]:
+        rows = self.query(
+            """SELECT template_key,rule_code,document_type,model_fingerprint,action,COUNT(*) count
+               FROM learning_feedback WHERE active=1
+               GROUP BY template_key,rule_code,document_type,model_fingerprint,action"""
+        )
+        grouped: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+        for row in rows:
+            key = (row["template_key"], row["rule_code"], row["document_type"], row["model_fingerprint"])
+            grouped.setdefault(key, {"actions": {}})["actions"][row["action"]] = int(row["count"])
+        patterns = []
+        for key, value in grouped.items():
+            policy = self.feedback_policy_for(
+                template_key=key[0], rule_code=key[1], document_type=key[2], model_fingerprint=key[3]
+            )
+            patterns.append({"template": key[0], "rule_code": key[1], "document_type": key[2],
+                             "model_fingerprint": key[3], **value, **policy})
+        total = sum(item["sample_count"] for item in patterns)
+        rejected = sum(item["actions"].get("误报驳回", 0) for item in patterns)
+        confirmed = sum(item["actions"].get("确认问题", 0) for item in patterns)
+        missed = sum(item["actions"].get("补充漏检问题", 0) for item in patterns)
+        reports = self.one("SELECT COUNT(DISTINCT batch_fingerprint) count FROM learning_feedback WHERE active=1")
+        return {"total": total, "confirmed": confirmed, "rejected": rejected, "missed": missed,
+                "confirmation_rate": confirmed / total if total else 0.0,
+                "rejection_rate": rejected / total if total else 0.0,
+                "report_count": int(reports["count"] if reports else 0), "patterns": patterns}
+
+    def set_feedback_pattern_enabled(self, pattern_key: str, enabled: bool) -> None:
+        self.execute(
+            """INSERT INTO feedback_pattern_state(pattern_key,enabled,updated_at) VALUES(?,?,?)
+               ON CONFLICT(pattern_key) DO UPDATE SET enabled=excluded.enabled,updated_at=excluded.updated_at""",
+            (pattern_key, int(enabled), utcnow()),
+        )
+
+    def clear_learning_feedback(self, pattern_key: str | None = None) -> None:
+        if not pattern_key:
+            self.execute("UPDATE learning_feedback SET active=0 WHERE active=1")
+            return
+        for row in self.learning_summary()["patterns"]:
+            if row["pattern_key"] == pattern_key:
+                self.execute(
+                    """UPDATE learning_feedback SET active=0 WHERE template_key=? AND rule_code=?
+                       AND document_type=? AND model_fingerprint=?""",
+                    (row["template"], row["rule_code"], row["document_type"], row["model_fingerprint"]),
+                )
+
+    def export_learning_feedback(self) -> str:
+        rows = self.query(
+            """SELECT template_key,task_key,rule_code,document_type,action,reason_code,corrected_status,
+               corrected_severity,evidence_fingerprint,model_fingerprint,created_at FROM learning_feedback
+               WHERE active=1 ORDER BY id"""
+        )
+        return "\n".join(json.dumps(row, ensure_ascii=False, sort_keys=True) for row in rows)
+
+    def _document_type_for_finding(self, finding: dict[str, Any]) -> str:
+        row = self.one(
+            """SELECT d.detected_type,d.document_kind FROM batch_documents bd JOIN documents d ON d.id=bd.document_id
+               WHERE bd.batch_id=? AND d.original_name=? LIMIT 1""",
+            (finding["batch_id"], finding.get("source_file") or ""),
+        )
+        return str((row or {}).get("detected_type") or (row or {}).get("document_kind") or "")
 
     def request_cancel(self, batch_id: str) -> bool:
         row = self.one("SELECT status FROM review_batches WHERE id=? AND deleted_at=''", (batch_id,))
@@ -416,7 +647,8 @@ class ReviewDatabase:
     def restore_batch(self, batch_id: str) -> None:
         self.update_batch(batch_id, deleted_at="", purge_after="")
 
-    def purge_batch(self, batch_id: str, force: bool = False) -> list[dict[str, Any]]:
+    def purge_batch(self, batch_id: str, force: bool = False,
+                    retain_learning: bool = True) -> list[dict[str, Any]]:
         """Permanently remove a trashed batch and return private documents for filesystem cleanup."""
         batch = self.one("SELECT deleted_at,purge_after FROM review_batches WHERE id=?", (batch_id,))
         if not batch or not batch["deleted_at"]:
@@ -430,6 +662,14 @@ class ReviewDatabase:
             (batch_id, batch_id),
         )
         with self.connect() as connection:
+            batch_fingerprint = _fingerprint(batch_id)
+            if retain_learning:
+                connection.execute(
+                    "UPDATE learning_feedback SET batch_fingerprint='',finding_fingerprint='' WHERE batch_fingerprint=?",
+                    (batch_fingerprint,),
+                )
+            else:
+                connection.execute("DELETE FROM learning_feedback WHERE batch_fingerprint=?", (batch_fingerprint,))
             connection.execute("DELETE FROM review_batches WHERE id=?", (batch_id,))
             connection.executemany("DELETE FROM documents WHERE id=?", [(row["id"],) for row in private])
         return private
@@ -493,3 +733,11 @@ class ReviewDatabase:
 
 def utcnow() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _fingerprint(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest() if value else ""
+
+
+def _policy_key(template_key: str, rule_code: str, document_type: str, model_fingerprint: str) -> str:
+    return _fingerprint("\x1f".join((template_key, rule_code, document_type, model_fingerprint)))

@@ -24,6 +24,6 @@ def get_context() -> UIContext:
     db = ReviewDatabase(config.storage.database_v2)
     store = ConfigStore(db, ROOT / "data" / "secrets" / "service.key")
     service = ReviewService(db, store, config.storage.uploads, config.storage.standards,
-                            config.storage.vector_db, config.audit.max_upload_mb)
+                            config.storage.vector_db, config.audit.max_upload_mb,
+                            config.audit.confidence_threshold)
     return UIContext(config, db, store, service)
-

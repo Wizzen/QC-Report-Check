@@ -15,7 +15,8 @@ def build_service() -> tuple[ReviewDatabase, ReviewService]:
     db = ReviewDatabase(config.storage.database_v2)
     store = ConfigStore(db, ROOT / "data" / "secrets" / "service.key")
     return db, ReviewService(db, store, config.storage.uploads, config.storage.standards,
-                             config.storage.vector_db, config.audit.max_upload_mb)
+                             config.storage.vector_db, config.audit.max_upload_mb,
+                             config.audit.confidence_threshold)
 
 
 def main() -> int:

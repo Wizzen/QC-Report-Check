@@ -6,6 +6,7 @@ import logging
 import mimetypes
 import re
 import shutil
+import tempfile
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from io import BytesIO
 from pathlib import Path
@@ -46,10 +47,13 @@ class ReviewCancelled(RuntimeError):
 
 class ReviewService:
     def __init__(self, db: ReviewDatabase, config_store: ConfigStore, uploads: Path,
-                 standards: Path, vector_root: Path, max_upload_mb: int = 100):
+                 standards: Path, vector_root: Path, max_upload_mb: int = 100,
+                 confidence_threshold: float = 0.70):
         self.db, self.config_store = db, config_store
         self.uploads, self.standards, self.vector_root = uploads, standards, vector_root
         self.max_bytes = max_upload_mb * 1024 * 1024
+        self.confidence_threshold = max(0.0, min(1.0, float(confidence_threshold)))
+        self._deterministic_passes: dict[str, set[str]] = {}
         self._ensure_fastener_template()
         self._backfill_supplier_names()
         self._backfill_search_evidence()
@@ -156,8 +160,8 @@ class ReviewService:
             self.db.attach_document(batch_id, row["document_id"], row["role"], row["priority"])
         return batch_id
 
-    def purge_review(self, batch_id: str, force: bool = False) -> None:
-        private = self.db.purge_batch(batch_id, force=force)
+    def purge_review(self, batch_id: str, force: bool = False, retain_learning: bool = True) -> None:
+        private = self.db.purge_batch(batch_id, force=force, retain_learning=retain_learning)
         for row in private:
             path = Path(str(row["stored_path"]))
             if path.is_file():
@@ -243,6 +247,8 @@ class ReviewService:
                         )
             summary = {level: sum(item.severity == level for item in findings) for level in ("Critical", "Major", "Minor", "Warning", "Review")}
             summary["total"] = len(findings)
+            summary["formal_total"] = sum(item.severity != "Review" for item in findings)
+            summary["review_total"] = sum(item.severity == "Review" for item in findings)
             self._activity(batch_id, status="completed", stage="审核完成", progress=100, summary=summary, completed_at=utcnow(),
                            activity="所有阶段已完成，结果可以查看", resource="本机")
             self.db.execute("UPDATE jobs SET status='completed',updated_at=? WHERE batch_id=?", (utcnow(), batch_id))
@@ -282,10 +288,14 @@ class ReviewService:
             self._activity(batch_id, activity=f"正在提交 {row['original_name']} 并等待 OCR 识别结果",
                            resource=_resource("OCR", settings.ocr_base_url, settings.ocr_backend))
             try:
-                markdown = MinerUClient(settings).ocr(path)
+                client = MinerUClient(settings)
+                if path.suffix.lower() == ".pdf":
+                    ocr_pages = _ocr_sparse_pdf_pages(path, sparse_pages, client)
+                else:
+                    ocr_pages = {sparse_pages[0]: client.ocr(path)}
                 self._check_cancel(batch_id)
-                pages = _merge_ocr_text(pages, markdown, sparse_pages)
-                ocr_status = "completed"
+                pages = _merge_ocr_text(pages, ocr_pages, sparse_pages)
+                ocr_status = "completed" if len(ocr_pages) == len(sparse_pages) else "partial"
             except ReviewCancelled:
                 raise
             except Exception as exc:
@@ -377,7 +387,9 @@ class ReviewService:
             snapshot = {}
         if template and snapshot:
             template = {**template, **{key: snapshot[key] for key in ("name", "description", "required_items", "review_instructions") if key in snapshot}}
-        findings = AuditEngine().audit(documents, requirements)
+        engine = AuditEngine()
+        findings = engine.audit(documents, requirements)
+        self._deterministic_passes[batch_id] = set(engine.last_passed_items)
         if template and _uses_fastener_audit(template):
             expert_documents = [_expert_document(row) for row in document_rows]
             findings.extend(deterministic_fastener_audit(expert_documents))
@@ -428,7 +440,6 @@ class ReviewService:
             """SELECT d.original_name,d.raw_text FROM batch_documents bd JOIN documents d ON d.id=bd.document_id
                WHERE bd.batch_id=? AND bd.role IN ('selected_basis','supplemental_basis') ORDER BY bd.priority""", (batch_id,)
         )
-        basis = self._basis_context(batch_id, basis_rows)
         client = LLMClient(settings)
         try:
             resolved_model = client.resolve_model()
@@ -463,7 +474,8 @@ class ReviewService:
 
         def run_task(index: int, task: str) -> tuple[int, str, dict[str, object], Finding | None]:
             self._check_cancel(batch_id)
-            task_documents = _rule_evidence_documents(documents, task, max_chars=8_000)
+            task_documents = self._task_evidence_documents(batch_id, documents, task)
+            basis = self._basis_context(batch_id, basis_rows, task)
             prompt = build_rule_task_prompt(task, task_documents, instructions, findings, basis)
             self._check_cancel(batch_id)
             if review_mode == "deep":
@@ -484,7 +496,36 @@ class ReviewService:
                     quick_prompt, retries=1, timeout_seconds=min(90, settings.llm_timeout_seconds),
                     max_tokens=220, thinking=False,
                 )
-            evaluation, finding = rule_evaluation_from_llm(payload, task, documents)
+            likely_type = _preferred_document_type(task)
+            policy = self.db.feedback_policy_for(
+                template_key=str(snapshot.get("name") or batch.get("template_id") or ""),
+                rule_code=task, document_type=likely_type, model_fingerprint=resolved_model,
+            )
+            evaluation, finding = rule_evaluation_from_llm(
+                payload, task, documents, self.confidence_threshold, policy,
+                deterministic_result=_deterministic_result_for_task(
+                    findings, task, self._deterministic_passes.get(batch_id, set())
+                ),
+            )
+            if finding and finding.severity == "Major":
+                verify_prompt = (
+                    "只复核下面不合格结论是否被所给原文直接支持。只返回 JSON："
+                    '{"confirmed":true|false}。不得补充外部知识。\n'
+                    f"任务：{task}\n原文：{finding.source_text}\n结论：{finding.description}"
+                )
+                try:
+                    verification = client.generate_json(
+                        verify_prompt, retries=0, timeout_seconds=min(45, settings.llm_timeout_seconds),
+                        max_tokens=80, thinking=False,
+                    )
+                    verified = bool(verification.get("confirmed"))
+                except Exception:
+                    verified = False
+                if not verified:
+                    finding.severity = "Review"
+                    finding.metadata.setdefault("downgrade_reasons", []).append("second_review_not_confirmed")
+                    evaluation["status"] = "存疑"
+                    evaluation.setdefault("downgrade_reasons", []).append("second_review_not_confirmed")
             return index, task, evaluation, finding
 
         executor = ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="audit-rule")
@@ -518,10 +559,12 @@ class ReviewService:
                     else:
                         self.db.execute(
                             """UPDATE rule_evaluations SET status=?,conclusion=?,source_file=?,source_page=?,evidence=?,evidence_type=?,
-                               actual=?,requirement=?,logic=?,suggestion=?,confidence=?,completed_at=? WHERE batch_id=? AND task_index=?""",
+                               actual=?,requirement=?,logic=?,suggestion=?,confidence=?,metadata=?,completed_at=? WHERE batch_id=? AND task_index=?""",
                             (evaluation["status"], evaluation["conclusion"], evaluation["source_file"], evaluation["source_page"],
                              evaluation["evidence"], evaluation["evidence_type"], evaluation["actual"], evaluation["requirement"],
-                             evaluation["logic"], evaluation["suggestion"], evaluation["confidence"], utcnow(), batch_id, index),
+                             evaluation["logic"], evaluation["suggestion"], evaluation["confidence"],
+                             json.dumps({"downgrade_reasons": evaluation.get("downgrade_reasons", [])}, ensure_ascii=False),
+                             utcnow(), batch_id, index),
                         )
                         if finding:
                             discovered.append(finding)
@@ -555,7 +598,7 @@ class ReviewService:
                        resource=llm_resource)
         return _dedupe_findings([*findings, *discovered])
 
-    def _basis_context(self, batch_id: str, basis_rows: list[dict[str, object]]) -> str:
+    def _basis_context(self, batch_id: str, basis_rows: list[dict[str, object]], task: str = "") -> str:
         """Rank selected basis pages with local exact terms; no vector model is used."""
         ids = [row["id"] for row in self.db.query(
             """SELECT d.id FROM batch_documents bd JOIN documents d ON d.id=bd.document_id
@@ -570,19 +613,31 @@ class ReviewService:
         pages = self.db.query(
             f"SELECT document_id,page,content FROM document_fts WHERE document_id IN ({placeholders})", ids
         )
-        terms = ("标准", "要求", "条款", "规格", "材料", "炉号", "化学", "机械", "尺寸", "检验",
-                 "standard", "requirement", "specification", "material", "chemical", "mechanical", "dimension", "inspection")
+        terms = _task_tokens(task) | {"标准", "要求", "条款", "规格", "standard", "requirement", "clause"}
         ranked = sorted(
             pages,
-            key=lambda row: sum(str(row["content"]).casefold().count(term) for term in terms),
+            key=lambda row: _page_relevance(str(row["content"]), terms),
             reverse=True,
-        )[:12]
+        )[:4]
         if ranked:
             return "\n\n".join(
-                f"[依据={names.get(row['document_id'], row['document_id'])}][页={row['page']}]\n{str(row['content'])[:2500]}"
+                f"[依据={names.get(row['document_id'], row['document_id'])}][页={row['page']}]\n{str(row['content'])[:1500]}"
                 for row in ranked
-            )
-        return "\n".join(f"[依据={row['original_name']}]\n{str(row['raw_text'])[:12000]}" for row in basis_rows)
+            )[:6000]
+        return "\n".join(f"[依据={row['original_name']}]\n{str(row['raw_text'])[:1500]}" for row in basis_rows)[:6000]
+
+    def _task_evidence_documents(self, batch_id: str, documents: list[ExpertDocument],
+                                 task: str) -> list[ExpertDocument]:
+        rows = self.db.query(
+            """SELECT d.original_name,f.field_key,f.raw_value,f.page,f.source_text,f.bbox,f.row_index,f.column_index
+               FROM batch_documents bd JOIN documents d ON d.id=bd.document_id
+               JOIN document_fields f ON f.document_id=d.id WHERE bd.batch_id=? AND bd.role='supplier'
+               ORDER BY f.confidence DESC""", (batch_id,),
+        )
+        fields: dict[str, list[dict[str, object]]] = {}
+        for row in rows:
+            fields.setdefault(str(row["original_name"]), []).append(row)
+        return _rule_evidence_documents(documents, task, max_chars=8_000, fields_by_filename=fields)
 
     def _refresh_supplier_names_for_document(self, document_id: str) -> None:
         batch_rows = self.db.query("SELECT batch_id FROM batch_documents WHERE document_id=? AND role='supplier'", (document_id,))
@@ -775,7 +830,8 @@ def _expert_document_chunks(documents: list[ExpertDocument], max_chars: int = 14
 
 
 def _rule_evidence_documents(
-    documents: list[ExpertDocument], task: str, max_chars: int = 14_000
+    documents: list[ExpertDocument], task: str, max_chars: int = 14_000,
+    fields_by_filename: dict[str, list[dict[str, object]]] | None = None,
 ) -> list[ExpertDocument]:
     """Build one compact, page-aware evidence package for one extensible template task."""
     latin = set(re.findall(r"[a-z]+|\d+", task.casefold()))
@@ -794,7 +850,15 @@ def _rule_evidence_documents(
         for page in document.pages:
             lines = [line.strip() for line in page.text.splitlines() if line.strip()]
             relevant = [line for line in lines if markers.search(line) or any(token in line.casefold() for token in tokens)]
-            preview = "\n".join([*lines[:6], *relevant])
+            field_lines = []
+            for field in (fields_by_filename or {}).get(document.filename, []):
+                if int(field.get("page") or 0) != page.page:
+                    continue
+                field_text = str(field.get("source_text") or field.get("raw_value") or "").strip()
+                if field_text and (any(token in field_text.casefold() for token in tokens) or field.get("bbox")):
+                    field_lines.append(f"[FIELD:{field.get('field_key')}][坐标={field.get('bbox')}] {field_text}")
+            table_rows = [line for line in lines if "[TABLE_ROW]" in line]
+            preview = "\n".join([*field_lines, *table_rows, *relevant, *lines[:6]])
             preview = "\n".join(dict.fromkeys(preview.splitlines()))[:1600]
             if not preview:
                 preview = page.text[:400]
@@ -811,25 +875,94 @@ def _rule_evidence_documents(
     return output
 
 
+def _task_tokens(task: str) -> set[str]:
+    latin = set(re.findall(r"[a-z]+|\d+", task.casefold()))
+    chinese = {task[index:index + 2] for index in range(len(task) - 1)
+               if "\u3400" <= task[index] <= "\u9fff" and "\u3400" <= task[index + 1] <= "\u9fff"}
+    return latin | chinese
+
+
+def _page_relevance(content: str, terms: set[str]) -> int:
+    lowered = content.casefold()
+    score = sum(lowered.count(term) * 4 for term in terms if term)
+    score += 6 * len(re.findall(r"(?:条款|clause|section|标准|standard|规格|specification)", content, re.I))
+    score += 5 * content.count("[TABLE_ROW]")
+    return score
+
+
+def _preferred_document_type(task: str) -> str:
+    upper = task.upper()
+    for kind in ("COC", "MTR", "COI"):
+        if kind in upper:
+            return kind
+    return ""
+
+
+def _deterministic_result_for_task(findings: list[Finding], task: str,
+                                   passed_items: set[str] | None = None) -> str:
+    normalized_task = re.sub(r"\s+", "", task).casefold()
+    aliases = {
+        "tensile_strength": ("抗拉", "tensile"), "yield_strength": ("屈服", "yield"),
+        "elongation": ("延伸", "elongation"), "material_grade": ("材料", "material"),
+        "heat_number": ("炉号", "heat"), "batch_number": ("批次", "batch"),
+    }
+    for item in passed_items or set():
+        terms = (item.casefold(), *aliases.get(item, ()))
+        if any(term and term in normalized_task for term in terms):
+            return "合格"
+    for finding in findings:
+        if finding.item == task and finding.metadata.get("deterministic_result") == "合格":
+            return "合格"
+    return ""
+
+
 def _resource(kind: str, base_url: str, model: str) -> str:
     host = urlsplit(base_url).netloc or base_url
     detail = model.strip() or "未指定模型"
     return f"{kind} · {detail} · {host}"
 
 
-def _merge_ocr_text(pages: list[PageText], markdown: str, sparse_pages: list[int]) -> list[PageText]:
+def _merge_ocr_text(pages: list[PageText], markdown: str | dict[int, str],
+                    sparse_pages: list[int]) -> list[PageText]:
     """Preserve good text-layer pages and attach OCR output to pages that were empty."""
     if not sparse_pages:
         return pages
-    target = sparse_pages[0]
+    mapped = markdown if isinstance(markdown, dict) else {sparse_pages[0]: markdown}
     output: list[PageText] = []
     for page in pages:
-        if page.page == target:
-            merged = "\n\n".join(part for part in (page.text.strip(), "[OCR]\n" + markdown.strip()) if part.strip())
+        if page.page in sparse_pages:
+            recognized = str(mapped.get(page.page) or "").strip()
+            marker = "[OCR]\n" + recognized if recognized else "[OCR_FAILED_PAGE]"
+            merged = "\n\n".join(part for part in (page.text.strip(), marker) if part.strip())
             output.append(PageText(page.page, merged))
         else:
             output.append(page)
     return output
+
+
+def _ocr_sparse_pdf_pages(path: Path, sparse_pages: list[int], client: MinerUClient) -> dict[int, str]:
+    """OCR each sparse PDF page independently so results retain original page numbers."""
+    results: dict[int, str] = {}
+    source = pymupdf.open(path)
+    try:
+        with tempfile.TemporaryDirectory(prefix="qaqc-ocr-") as directory:
+            for page_number in sparse_pages:
+                if not 1 <= page_number <= source.page_count:
+                    continue
+                single = pymupdf.open()
+                try:
+                    single.insert_pdf(source, from_page=page_number - 1, to_page=page_number - 1)
+                    target = Path(directory) / f"page-{page_number}.pdf"
+                    single.save(target)
+                finally:
+                    single.close()
+                try:
+                    results[page_number] = client.ocr(target)
+                except Exception as exc:
+                    LOGGER.warning("第 %s 页 OCR 失败：%s", page_number, type(exc).__name__)
+    finally:
+        source.close()
+    return results
 
 
 def _expert_document(row: dict[str, object]) -> ExpertDocument:

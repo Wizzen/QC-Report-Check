@@ -26,6 +26,7 @@ GLOBAL_CSS = """
 .qaqc-badge {display:inline-flex; align-items:center; border:1px solid #e5e7eb; border-radius:999px; padding:.25rem .6rem; font-size:.76rem; color:#475569; background:#fff;}
 .qaqc-badge.remote {color:#9a3412; background:#fff7ed; border-color:#fed7aa;}
 .qaqc-evidence {border:1px solid #e5e7eb; border-radius:.9rem; padding:1rem; background:#fafafa; min-height:180px;}
+.qaqc-evidence + .qaqc-evidence {margin-top:.75rem;}
 .qaqc-evidence .meta {font-size:.78rem; color:#667085; margin-bottom:.75rem;}
 .qaqc-evidence pre {white-space:pre-wrap; word-break:break-word; font-size:.84rem; margin:0; font-family:ui-monospace,SFMono-Regular,Consolas,monospace;}
 .st-key-dashboard_all button,.st-key-dashboard_completed button,.st-key-dashboard_processing button,
@@ -34,6 +35,9 @@ GLOBAL_CSS = """
 }
 .st-key-dashboard_all button p,.st-key-dashboard_completed button p,.st-key-dashboard_processing button p,
 .st-key-dashboard_issues button p,.st-key-dashboard_major button p,.st-key-dashboard_review button p {line-height:1.2;}
+[data-testid="stButton"] button {min-height:2.55rem;}
+[data-testid="stDownloadButton"] button {min-height:3rem; font-weight:700;}
+[data-testid="stDataFrame"] {border-radius:.75rem; overflow:hidden;}
 @media (max-width: 700px) {
   .stMainBlockContainer {padding:3rem 1rem 4rem;}
   .qaqc-hero {margin:.7rem auto 1.4rem;}
@@ -41,6 +45,7 @@ GLOBAL_CSS = """
   .qaqc-hero p {font-size:.96rem;}
   .st-key-upload_supplier [data-testid="stFileUploaderDropzone"],
   .st-key-upload_supplemental [data-testid="stFileUploaderDropzone"] {min-height:190px;}
+  .qaqc-evidence {min-height:0;}
 }
 </style>
 """

@@ -172,63 +172,49 @@ def batch_status_card(batch_id: str) -> None:
 
 def review_records_page() -> None:
     ctx = get_context()
-    _section_header("审核中心", "从批次总览进入问题、原文件、处理过程和导出；供应商档案已经整合到每个批次中。")
+    _section_header("审核中心", "按批次浏览，在同一工作台完成证据复核、人工反馈和整改流转。")
     active_batches = ctx.db.query(
         """SELECT b.*,t.name template_name,
            (SELECT COUNT(*) FROM findings f WHERE f.batch_id=b.id) finding_count,
+           (SELECT COUNT(*) FROM findings f WHERE f.batch_id=b.id AND f.severity<>'Review'
+              AND f.status NOT IN ('误报驳回','不适用')) formal_count,
            (SELECT COUNT(*) FROM findings f WHERE f.batch_id=b.id AND f.severity IN ('Critical','Major')) major_count,
            (SELECT COUNT(*) FROM findings f WHERE f.batch_id=b.id AND f.severity='Review' AND f.status='AI发现') review_count
            FROM review_batches b LEFT JOIN audit_templates t ON t.id=b.template_id
            WHERE b.deleted_at='' ORDER BY b.created_at DESC"""
     )
-    active_tasks = ctx.db.query(
-        """SELECT j.id,j.batch_id,j.status job_status,j.attempts,j.locked_at,j.error job_error,
-                  j.created_at,j.updated_at,b.name,b.status batch_status,b.stage,b.progress,b.activity,
-                  b.resource,b.heartbeat_at,b.supplier_name,b.deleted_at,t.name template_name
-           FROM jobs j JOIN review_batches b ON b.id=j.batch_id
-           LEFT JOIN audit_templates t ON t.id=b.template_id
-           WHERE b.deleted_at='' ORDER BY j.created_at DESC"""
-    )
-    selected_task_batch = _render_all_tasks_dashboard(active_tasks)
-    if selected_task_batch:
-        st.session_state["record_batch"] = selected_task_batch
+    selected_task_batch = ""
     trash_count = int(ctx.db.one(
         "SELECT COUNT(*) count FROM review_batches WHERE deleted_at<>''"
     )["count"])
-    with st.container(border=True):
-        trash_bar = st.container(horizontal=True, horizontal_alignment="distribute", vertical_alignment="center")
-        with trash_bar:
-            st.caption(f"回收站 · {trash_count} 条记录（不计入本页任务、批次和问题统计）")
-            if st.button("浏览回收站", icon=":material/recycling:", key="browse_review_trash"):
-                _review_trash_dialog()
-    dashboard_filter = str(st.session_state.get("review_dashboard_filter") or "all")
+    try:
+        worker_state = json.loads((ROOT / ".worker-status.json").read_text(encoding="utf-8"))
+        worker_label = {"online": "在线", "restarting": "恢复中", "failed": "异常", "stopped": "停止"}.get(
+            str(worker_state.get("status")), "未知"
+        )
+    except (OSError, ValueError, TypeError):
+        worker_label = "未知"
+    dashboard_filter = "all"
     totals = {
-        "all": len(active_batches),
-        "completed": sum(row["status"] == "completed" for row in active_batches),
         "processing": sum(row["status"] in {"queued", "running"} for row in active_batches),
-        "issues": sum(int(row["finding_count"] or 0) for row in active_batches),
-        "major": sum(int(row["major_count"] or 0) for row in active_batches),
+        "formal": sum(int(row["formal_count"] or 0) for row in active_batches),
         "review": sum(int(row["review_count"] or 0) for row in active_batches),
     }
-    cards = [
-        ("all", "全部批次"), ("completed", "已完成"), ("processing", "审核中"),
-        ("issues", "问题总数"), ("major", "严重/主要"), ("review", "待人工复核"),
-    ]
-    for offset in range(0, len(cards), 3):
-        card_columns = st.columns(3)
-        for column, (key, label) in zip(card_columns, cards[offset:offset + 3]):
-            if column.button(
-                f"{label}\n\n{totals[key]}", key=f"dashboard_{key}", width="stretch",
-                type="primary" if dashboard_filter == key else "secondary",
-            ):
-                st.session_state["review_dashboard_filter"] = key
-                st.rerun()
-    st.caption("点击上方总数卡片即可筛选下方批次表；再点击表格中的一行查看问题、文件、过程和导出。")
+    metric_columns = st.columns(4)
+    metric_columns[0].metric("Worker", worker_label, border=True)
+    metric_columns[1].metric("审核中", totals["processing"], border=True)
+    metric_columns[2].metric("正式问题", totals["formal"], border=True)
+    metric_columns[3].metric("待人工复核", totals["review"], border=True)
+    top_actions = st.container(horizontal=True, horizontal_alignment="right", vertical_alignment="center")
+    with top_actions:
+        if st.button(f"回收站 {trash_count}", icon=":material/recycling:", key="browse_review_trash"):
+            _review_trash_dialog()
+    _render_learning_panel()
     batches = active_batches
     if not batches:
         st.info("暂无审核记录。请先在“开始审核”上传文件；已删除记录可通过上方小块浏览。")
         return
-    st.subheader("审核批次表")
+    st.subheader("审核批次")
     with st.container(border=True):
         filters = st.container(horizontal=True, vertical_alignment="bottom")
         with filters:
@@ -276,11 +262,13 @@ def review_records_page() -> None:
             _confirm_delete(batch_id, str(batch["name"]), permanent=False)
     if batch["status"] != "completed":
         batch_status_card(batch_id)
-    detail_view = st.segmented_control("批次详情", ["问题", "文件", "处理过程", "导出"], default="问题", key=f"batch_view_{batch_id}")
-    if detail_view == "问题": _render_findings(batch_id)
-    elif detail_view == "文件": _render_batch_files(batch_id)
-    elif detail_view == "处理过程": _render_job_events(batch_id)
-    else: _render_exports(batch_id)
+    _render_download_card(batch_id)
+    detail_view = st.segmented_control("批次详情", ["人工复核", "全部规则", "文件证据", "处理记录"], default="人工复核", key=f"batch_view_{batch_id}")
+    if detail_view == "人工复核": _render_findings(batch_id)
+    elif detail_view == "全部规则": _render_rule_evaluations(batch_id)
+    elif detail_view == "文件证据": _render_batch_files(batch_id)
+    elif detail_view == "处理记录": _render_job_events(batch_id)
+    else: _render_job_events(batch_id)
 
 
 def _render_all_tasks_dashboard(tasks: list[dict[str, object]]) -> str:
@@ -389,6 +377,11 @@ def _review_trash_dialog() -> None:
         "我确认立即永久删除所选记录及其专属文件（无法恢复）",
         key=f"force_purge_confirm_{selected['id']}",
     )
+    learning_choice = st.radio(
+        "学习记录处理", ["保留匿名学习模式", "同时删除学习记录"],
+        key=f"purge_learning_{selected['id']}",
+        help="保留模式只留下规则类别和统计，不保留文件、原文或业务值。",
+    )
     with st.container(horizontal=True):
         if st.button("恢复到审核中心", icon=":material/restore:", key=f"trash_restore_{selected['id']}"):
             ctx.db.restore_batch(str(selected["id"]))
@@ -398,16 +391,20 @@ def _review_trash_dialog() -> None:
             "立即永久删除", icon=":material/delete_forever:", type="primary",
             disabled=not confirmed, key=f"trash_force_purge_{selected['id']}",
         ):
-            _force_purge_review(ctx, str(selected["id"]))
+            _force_purge_review(ctx, str(selected["id"]), retain_learning=learning_choice == "保留匿名学习模式")
             st.toast("审核记录已永久删除", icon=":material/delete_forever:")
             st.rerun()
 
 
-def _force_purge_review(ctx: object, batch_id: str) -> None:
+def _force_purge_review(ctx: object, batch_id: str, retain_learning: bool = True) -> None:
     """Force deletion while remaining compatible with a pre-update cached service."""
     purge = ctx.service.purge_review  # type: ignore[attr-defined]
-    if "force" in inspect.signature(purge).parameters:
-        purge(batch_id, force=True)
+    parameters = inspect.signature(purge).parameters
+    if "force" in parameters:
+        kwargs = {"force": True}
+        if "retain_learning" in parameters:
+            kwargs["retain_learning"] = retain_learning
+        purge(batch_id, **kwargs)
         return
     # Streamlit may still hold the previous ReviewService object. Expiring the
     # retention timestamp lets that implementation perform its normal, safe
@@ -435,10 +432,33 @@ def _confirm_delete(batch_id: str, name: str, permanent: bool) -> None:
 def _render_findings(batch_id: str) -> None:
     ctx = get_context()
     findings = ctx.db.query("SELECT * FROM findings WHERE batch_id=? ORDER BY CASE severity WHEN 'Critical' THEN 1 WHEN 'Major' THEN 2 WHEN 'Minor' THEN 3 WHEN 'Warning' THEN 4 ELSE 5 END,id", (batch_id,))
-    summary_cols = st.columns(5)
-    for column, level in zip(summary_cols, ["Critical", "Major", "Minor", "Warning", "Review"]):
-        column.metric(level, sum(row["severity"] == level for row in findings), border=True)
-    _render_rule_evaluations(batch_id)
+    documents = ctx.db.query(
+        """SELECT d.original_name,d.detected_type FROM batch_documents bd JOIN documents d ON d.id=bd.document_id
+           WHERE bd.batch_id=? AND bd.role='supplier' ORDER BY d.created_at""", (batch_id,),
+    )
+    with st.expander("补充漏检问题", icon=":material/add_circle:"):
+        if documents:
+            with st.form(f"manual_finding_{batch_id}", clear_on_submit=True):
+                manual_item = st.text_input("问题名称")
+                manual_description = st.text_area("问题说明")
+                manual_severity = st.selectbox("严重程度", ["Major", "Minor", "Warning", "Review"])
+                manual_file = st.selectbox("证据文件", [row["original_name"] for row in documents])
+                manual_page = st.number_input("页码", min_value=1, step=1)
+                manual_evidence = st.text_area("逐字证据")
+                manual_requirement = st.text_area("判断依据")
+                if st.form_submit_button("添加漏检问题", type="primary"):
+                    try:
+                        ctx.db.add_manual_finding(
+                            batch_id, item=manual_item, description=manual_description, severity=manual_severity,
+                            source_file=manual_file, source_page=int(manual_page), evidence=manual_evidence,
+                            requirement=manual_requirement, service_fingerprint=_service_fingerprint(ctx),
+                        )
+                        st.toast("漏检问题已补充，并记录为学习样本", icon=":material/check_circle:")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(str(exc))
+        else:
+            st.info("该批次没有可关联的供应商文件。")
     if not findings:
         batch = ctx.db.one("SELECT status FROM review_batches WHERE id=?", (batch_id,))
         if batch and batch["status"] == "completed":
@@ -446,91 +466,167 @@ def _render_findings(batch_id: str) -> None:
         else:
             st.info("该批次未完成，因此没有发布问题结果。可重新审核后查看完整结论。")
         return
-    selected_levels = st.pills("严重程度", ["Critical", "Major", "Minor", "Warning", "Review"],
-                               default=["Critical", "Major", "Minor", "Warning", "Review"], selection_mode="multi")
-    visible = [row for row in findings if row["severity"] in (selected_levels or [])]
-    frame = pd.DataFrame(visible)
-    table_event = st.dataframe(frame[["id", "severity", "category", "item", "source_file", "source_page", "actual", "requirement", "status"]],
-                 width="stretch", hide_index=True, on_select="rerun", selection_mode="single-row", key=f"finding_table_{batch_id}",
-                 column_config={"id": "ID", "severity": "等级", "category": "类别", "item": "检查项目",
-                                "source_file": "供应商文件", "source_page": "页码", "actual": "实际",
-                                "requirement": "要求", "status": "状态"})
-    labels = {f"#{row['id']} [{row['severity']}] {row['description']}": row for row in visible}
-    if not labels:
+    queue_scope = st.segmented_control(
+        "问题队列", ["待处理", "全部问题"], default="待处理", key=f"finding_scope_{batch_id}",
+    )
+    visible = findings if queue_scope == "全部问题" else [
+        row for row in findings if row["status"] in {"AI发现", "待人工复核", "已整改", "重新打开"}
+    ]
+    if not visible:
+        st.success("当前没有待处理问题；可切换到“全部问题”查看历史结论。")
         return
+    queue, workspace = st.columns([2, 3], gap="large")
     preferred_finding = st.session_state.get(f"selected_finding_{batch_id}")
+    with queue:
+        st.markdown("**待复核问题队列**")
+        queue_frame = pd.DataFrame([{
+            "ID": row["id"], "等级": row["severity"], "检查项": row["item"],
+            "文件/页": f"{row['source_file']} / {row['source_page']}", "状态": row["status"],
+        } for row in visible])
+        table_event = st.dataframe(
+            queue_frame, width="stretch", hide_index=True, on_select="rerun",
+            selection_mode="single-row", key=f"finding_queue_{batch_id}", height=420,
+            column_config={"ID": st.column_config.NumberColumn(width="small"),
+                           "等级": st.column_config.TextColumn(width="small")},
+        )
     if table_event.selection.rows:
         selected = visible[table_event.selection.rows[0]]
     elif preferred_finding and any(row["id"] == preferred_finding for row in visible):
         selected = next(row for row in visible if row["id"] == preferred_finding)
     else:
-        selected = labels[st.selectbox("问题详情", list(labels), key=f"finding_select_{batch_id}")]
+        selected = visible[0]
     st.session_state[f"selected_finding_{batch_id}"] = selected["id"]
-    left, right = st.columns(2, gap="large")
-    with left:
+    with workspace:
+        st.markdown(f"**#{selected['id']} · {selected['item']}**")
         source = html.escape(selected["source_text"] or selected["actual"] or "未提供")
-        st.html(f'<div class="qaqc-evidence"><strong>供应商文件证据</strong><div class="meta">{html.escape(selected["source_file"])} · 第 {selected["source_page"]} 页</div><pre>{source}</pre></div>')
-    with right:
         requirement = html.escape(selected["requirement"] or "缺少明确审核依据")
+        st.html(f'<div class="qaqc-evidence"><strong>供应商文件证据</strong><div class="meta">{html.escape(selected["source_file"])} · 第 {selected["source_page"]} 页</div><pre>{source}</pre></div>')
         st.html(f'<div class="qaqc-evidence"><strong>审核依据</strong><div class="meta">{html.escape(selected["standard_file"])} · 第 {selected["standard_page"]} 页 · 条款 {html.escape(selected["standard_clause"] or "-")}</div><pre>{requirement}</pre></div>')
-    with st.container(border=True):
         st.caption(f"判定置信度：{float(selected.get('decision_confidence') or selected['confidence']):.0%}")
         st.markdown(f"**判断逻辑**　{selected['logic'] or '待人工确认'}")
         st.markdown(f"**问题说明**　{selected['description']}")
         st.markdown(f"**整改建议**　{selected['suggestion']}")
-        with st.container(horizontal=True):
-            for label, status, icon in [("确认问题", "人工确认", ":material/check:"), ("驳回", "人工驳回", ":material/close:"),
-                                        ("已整改", "已整改", ":material/build:"), ("关闭", "已关闭", ":material/done_all:")]:
-                if st.button(label, icon=icon, key=f"finding_{selected['id']}_{status}"):
-                    current_settings = ctx.config_store.get()
-                    fingerprint = f"{current_settings.llm_base_url}|{current_settings.llm_model}|{current_settings.ocr_base_url}"
-                    ctx.db.update_finding_status(selected["id"], status, service_fingerprint=fingerprint); st.rerun()
-    evidence_rows = ctx.db.query(
-        """SELECT fe.*,d.stored_path,d.original_name FROM finding_evidence fe
-           LEFT JOIN documents d ON d.id=fe.document_id WHERE fe.finding_id=? ORDER BY fe.id""", (selected["id"],)
-    )
-    if not evidence_rows:
-        fallback = ctx.db.one(
-            """SELECT d.id document_id,d.stored_path,d.original_name FROM batch_documents bd JOIN documents d ON d.id=bd.document_id
-               WHERE bd.batch_id=? AND bd.role='supplier' AND d.original_name=? ORDER BY d.created_at LIMIT 1""",
-            (batch_id, selected["source_file"]),
+        _render_finding_actions(ctx, batch_id, selected)
+
+
+def _render_finding_actions(ctx: object, batch_id: str, selected: dict[str, object]) -> None:
+    finding_id = int(selected["id"])
+    st.markdown("**AI 结论处理**")
+    action_columns = st.columns(2)
+    if action_columns[0].button("确认问题", type="primary", icon=":material/check:",
+                                key=f"confirm_finding_{finding_id}", width="stretch"):
+        ctx.db.record_finding_feedback(  # type: ignore[attr-defined]
+            finding_id, action="确认问题", new_status="人工确认",
+            service_fingerprint=_service_fingerprint(ctx),
         )
-        if fallback:
-            evidence_rows = [{**fallback, "page": selected["source_page"], "source_text": selected["source_text"], "evidence_type": "source"}]
-    with st.container(border=True):
-        st.markdown("**原报告证据组合**")
-        if not evidence_rows:
-            st.info("未找到与该问题关联的原报告文件。")
+        st.toast("已确认问题，学习样本已更新", icon=":material/check_circle:")
+        st.rerun()
+    if action_columns[1].button("撤销上次人工操作", icon=":material/undo:",
+                                key=f"undo_finding_{finding_id}", width="stretch"):
+        if ctx.db.undo_last_feedback(finding_id):  # type: ignore[attr-defined]
+            st.toast("已撤销上次人工操作", icon=":material/undo:")
+            st.rerun()
+        st.warning("没有可撤销的人工操作。")
+    with st.expander("误报驳回", icon=":material/close:"):
+        with st.form(f"reject_finding_{finding_id}"):
+            reason = st.selectbox("驳回原因", ["OCR识别错误", "证据页错误", "依据引用错误", "上下文不足",
+                                                   "规则不适用", "阈值问题", "其他"])
+            corrected_value = st.text_input("正确值（可选）")
+            corrected_evidence = st.text_area("正确证据（可选）")
+            reject_note = st.text_area("备注（不会写入 LLM 提示）")
+            if st.form_submit_button("确认驳回"):
+                ctx.db.record_finding_feedback(  # type: ignore[attr-defined]
+                    finding_id, action="误报驳回", new_status="误报驳回", reason_code=reason,
+                    correction=corrected_value, evidence=corrected_evidence, note=reject_note,
+                    service_fingerprint=_service_fingerprint(ctx),
+                )
+                st.toast("误报已驳回并形成结构化学习样本", icon=":material/check_circle:")
+                st.rerun()
+    with st.expander("修正结论", icon=":material/edit_note:"):
+        with st.form(f"correct_finding_{finding_id}"):
+            corrected_status = st.selectbox("正确状态", ["人工确认", "待人工复核", "不适用"])
+            corrected_severity = st.selectbox("正确严重程度", ["Critical", "Major", "Minor", "Warning", "Review"])
+            correction = st.text_area("正确结论")
+            correction_basis = st.text_area("正确依据/证据")
+            correction_note = st.text_area("备注（不会写入 LLM 提示）")
+            if st.form_submit_button("保存修正"):
+                try:
+                    ctx.db.record_finding_feedback(  # type: ignore[attr-defined]
+                        finding_id, action="修正结论", new_status=corrected_status,
+                        corrected_status=corrected_status, corrected_severity=corrected_severity,
+                        correction=correction, evidence=correction_basis, note=correction_note,
+                        service_fingerprint=_service_fingerprint(ctx),
+                    )
+                    st.toast("修正结论已保存", icon=":material/check_circle:")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(str(exc))
+    st.markdown("**整改流程**")
+    workflow = st.columns(3)
+    for column, label, status, icon in [
+        (workflow[0], "标记已整改", "已整改", ":material/build:"),
+        (workflow[1], "关闭问题", "已关闭", ":material/done_all:"),
+        (workflow[2], "重新打开", "重新打开", ":material/replay:"),
+    ]:
+        if column.button(label, icon=icon, key=f"workflow_{finding_id}_{status}", width="stretch"):
+            ctx.db.record_finding_feedback(  # type: ignore[attr-defined]
+                finding_id, action=label, new_status=status, learning_eligible=False,
+                service_fingerprint=_service_fingerprint(ctx),
+            )
+            st.toast(f"已{label}", icon=":material/check_circle:")
+            st.rerun()
+    if st.button("在文件证据中查看此页", icon=":material/find_in_page:", key=f"open_finding_page_{finding_id}"):
+        document = ctx.db.one(  # type: ignore[attr-defined]
+            """SELECT d.id FROM batch_documents bd JOIN documents d ON d.id=bd.document_id
+               WHERE bd.batch_id=? AND d.original_name=? LIMIT 1""",
+            (batch_id, selected.get("source_file") or ""),
+        )
+        if document:
+            st.session_state[f"batch_file_{batch_id}"] = document["id"]
+            st.session_state[f"batch_file_page_{batch_id}"] = int(selected.get("source_page") or 1)
+            st.session_state[f"batch_view_{batch_id}"] = "文件证据"
+            st.rerun()
+
+
+def _render_learning_panel() -> None:
+    ctx = get_context()
+    with st.expander("学习与准确率", icon=":material/model_training:"):
+        summary = ctx.db.learning_summary()
+        metrics = st.columns(4)
+        metrics[0].metric("确认率", f"{summary['confirmation_rate']:.0%}")
+        metrics[1].metric("误报率", f"{summary['rejection_rate']:.0%}")
+        metrics[2].metric("漏检补充", summary["missed"])
+        metrics[3].metric("有效样本", summary["total"])
+        patterns = summary["patterns"]
+        if patterns:
+            st.dataframe(pd.DataFrame([{
+                "模板": row["template"], "规则": row["rule_code"], "文档类型": row["document_type"] or "通用",
+                "样本": row["sample_count"], "距激活": row["remaining"],
+                "模式": "高误报降级" if row["downgrade_llm_issue"] else ("高确认优先" if row["prioritize_review"] else "观察中"),
+                "状态": "启用" if row["enabled"] else "已暂停",
+            } for row in patterns]), hide_index=True, width="stretch")
+            lookup = {f"{row['rule_code']} · {row['document_type'] or '通用'} · {row['sample_count']}条": row for row in patterns}
+            chosen = lookup[st.selectbox("管理学习模式", list(lookup), key="learning_pattern")]
+            controls = st.columns(2)
+            if controls[0].button("暂停" if chosen["enabled"] else "恢复", key="toggle_learning_pattern", width="stretch"):
+                ctx.db.set_feedback_pattern_enabled(chosen["pattern_key"], not chosen["enabled"])
+                st.rerun()
+            if controls[1].button("清空所选模式", key="clear_learning_pattern", width="stretch"):
+                ctx.db.clear_learning_feedback(chosen["pattern_key"])
+                st.toast("所选学习模式已清空")
+                st.rerun()
         else:
-            cols = st.columns(min(2, len(evidence_rows)))
-            for index, evidence in enumerate(evidence_rows):
-                with cols[index % len(cols)]:
-                    path = Path(str(evidence.get("stored_path") or ""))
-                    page = int(evidence.get("page") or 1)
-                    kind = str(evidence.get("evidence_type") or "source")
-                    if kind == "absence":
-                        st.info(f"缺失证明：{evidence.get('source_text') or '系统已扫描适用页面但未命中该字段'}", icon=":material/search_off:")
-                        if path.is_file() and path.suffix.casefold() == ".pdf":
-                            st.image(render_pdf_page(str(path), path.stat().st_mtime_ns, page), caption=f"代表页：{evidence.get('original_name')} · 第 {page} 页")
-                    elif path.is_file() and path.suffix.casefold() == ".pdf":
-                        try:
-                            bbox_values = json.loads(str(evidence.get("bbox") or "[]"))
-                            bbox = tuple(float(value) for value in bbox_values) if len(bbox_values) == 4 else None
-                        except (TypeError, ValueError, json.JSONDecodeError):
-                            bbox = None
-                        screenshot, matched = render_pdf_evidence(str(path), path.stat().st_mtime_ns, page,
-                            str(evidence.get("source_text") or ""), str(selected["actual"] or ""), str(selected["item"] or ""), bbox)
-                        st.image(screenshot, caption=(f"{evidence.get('original_name')} · 第 {page} 页 · 红框为定位证据" if matched
-                                                     else f"{evidence.get('original_name')} · 第 {page} 页 · 未精确定位，不绘制红框"))
-                    elif path.is_file() and path.suffix.casefold() in {".jpg", ".jpeg", ".png"}:
-                        st.image(str(path), caption=str(evidence.get("original_name") or "原始报告"))
-                    else:
-                        st.caption(f"{evidence.get('original_name') or selected['source_file']} · 第 {page} 页：{evidence.get('source_text') or '-'}")
-                    if st.button("在文件中查看", icon=":material/find_in_page:", key=f"open_evidence_{selected['id']}_{index}"):
-                        st.session_state[f"batch_file_{batch_id}"] = evidence.get("document_id")
-                        st.session_state[f"batch_file_page_{batch_id}"] = page
-                        st.session_state[f"batch_view_{batch_id}"] = "文件"
-                        st.rerun()
+            st.caption("尚无符合结构化要求的新反馈。旧反馈保留在审计历史中，但不参与自动校准。")
+        st.download_button("导出匿名 JSONL", ctx.db.export_learning_feedback(), "qaqc-learning.jsonl",
+                           "application/x-ndjson", icon=":material/download:")
+        remaining_feedback = max(0, 200 - int(summary["total"]))
+        remaining_reports = max(0, 50 - int(summary["report_count"]))
+        st.caption(f"LoRA 数据导出尚未启用：还需 {remaining_feedback} 条高质量反馈、{remaining_reports} 份报告。")
+
+
+def _service_fingerprint(ctx: object) -> str:
+    settings = ctx.config_store.get()  # type: ignore[attr-defined]
+    return str(settings.llm_model or "")
 
 
 def _render_rule_evaluations(batch_id: str) -> None:
@@ -616,7 +712,7 @@ def _render_batch_files(batch_id: str) -> None:
             for finding in related[:6]:
                 if st.button(f"{finding['rule_code'] or '#'+str(finding['id'])} · {finding['item']}", key=f"page_finding_{finding['id']}"):
                     st.session_state[f"selected_finding_{batch_id}"] = finding["id"]
-                    st.session_state[f"batch_view_{batch_id}"] = "问题"
+                    st.session_state[f"batch_view_{batch_id}"] = "人工复核"
                     st.rerun()
     left, right = st.columns([3, 2], gap="large")
     with left:
@@ -647,17 +743,34 @@ def _render_job_events(batch_id: str) -> None:
 
 
 def _render_exports(batch_id: str) -> None:
+    _render_download_card(batch_id)
+
+
+def _render_download_card(batch_id: str) -> None:
     ctx = get_context()
-    findings = ctx.db.query("SELECT id,status FROM findings WHERE batch_id=? ORDER BY id", (batch_id,))
+    findings = ctx.db.query("SELECT id,status,severity FROM findings WHERE batch_id=? ORDER BY id", (batch_id,))
+    feedback = ctx.db.query(
+        "SELECT id,action,corrected_status,corrected_severity,undone_at FROM review_feedback WHERE batch_id=? ORDER BY id",
+        (batch_id,),
+    )
     excel_data = export_batch(ctx.db, batch_id)
-    signature = json.dumps([(row["id"], row["status"]) for row in findings], ensure_ascii=False)
+    signature = json.dumps({"findings": findings, "feedback": feedback}, ensure_ascii=False, sort_keys=True)
     pdf_data = _cached_pdf_export(batch_id, signature, _db=ctx.db)
-    st.caption("导出文件包含批次、供应商、逐条规则结论、问题详情和可定位的原页证据。")
-    with st.container(horizontal=True):
-        st.download_button("导出问题清单.xlsx", excel_data, f"供应商质量问题清单-{batch_id[:8]}.xlsx",
-                           "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", icon=":material/table_view:")
-        st.download_button("导出审核报告.pdf", pdf_data, f"供应商质量审核报告-{batch_id[:8]}.pdf",
-                           "application/pdf", icon=":material/picture_as_pdf:")
+    processed = sum(row["status"] != "AI发现" for row in findings)
+    with st.container(border=True):
+        st.markdown("**下载最新审核结果**")
+        st.caption(f"当前人工状态：已处理 {processed}/{len(findings)} 条。每次反馈后会自动刷新导出缓存。")
+        download_columns = st.columns(2)
+        download_columns[0].download_button(
+            "下载完整审核报告 PDF", pdf_data, f"供应商质量审核报告-{batch_id[:8]}.pdf",
+            "application/pdf", icon=":material/picture_as_pdf:", type="primary", width="stretch",
+            key=f"download_pdf_{batch_id}",
+        )
+        download_columns[1].download_button(
+            "下载问题分析明细 Excel", excel_data, f"供应商质量问题分析-{batch_id[:8]}.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            icon=":material/table_view:", width="stretch", key=f"download_excel_{batch_id}",
+        )
 
 
 def basis_library_page() -> None:

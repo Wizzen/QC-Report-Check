@@ -258,6 +258,15 @@ def _finding_detail(index: int, finding: dict[str, object], file_lookup: dict[st
                          ("LEFTPADDING", (0, 0), (-1, -1), 6), ("RIGHTPADDING", (0, 0), (-1, -1), 6),
                          ("TOPPADDING", (0, 0), (-1, -1), 5), ("BOTTOMPADDING", (0, 0), (-1, -1), 5)]))
     blocks: list[object] = [title, Spacer(1, 4 * mm), metadata, Spacer(1, 6 * mm)]
+    try:
+        finding_metadata = json.loads(str(finding.get("metadata") or "{}"))
+    except (ValueError, TypeError):
+        finding_metadata = {}
+    downgrade_reasons = finding_metadata.get("downgrade_reasons", [])
+    if downgrade_reasons:
+        blocks.extend([Paragraph("自动降级原因", styles["detail_label"]),
+                       Paragraph(_safe("；".join(str(reason) for reason in downgrade_reasons)), styles["detail_value"]),
+                       Spacer(1, 3 * mm)])
     for label, key in (("问题说明", "description"), ("原报告证据", "source_text"), ("实际结果", "actual"),
                        ("审核要求", "requirement"), ("判断逻辑", "logic"), ("整改建议", "suggestion")):
         value = str(finding.get(key) or "-")
@@ -265,7 +274,7 @@ def _finding_detail(index: int, finding: dict[str, object], file_lookup: dict[st
                                     Paragraph(_safe(value[:4000]), styles["detail_value"]), Spacer(1, 3 * mm)]))
 
     try:
-        evidence = json.loads(str(finding.get("metadata") or "{}")).get("evidence", [])
+        evidence = finding_metadata.get("evidence", [])
     except (ValueError, TypeError):
         evidence = []
     if not evidence:

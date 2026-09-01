@@ -196,11 +196,14 @@ def build_rule_task_prompt(
 
 
 def rule_evaluation_from_llm(
-    payload: dict[str, object], task: str, documents: list[ExpertDocument]
+    payload: dict[str, object], task: str, documents: list[ExpertDocument],
+    confidence_threshold: float = 0.70, feedback_policy: dict[str, object] | None = None,
+    deterministic_result: str = "",
 ) -> tuple[dict[str, object], Finding | None]:
     # The adaptive path uses compact keys to reduce local-model generation time.
     # Full-key payloads remain supported for deep mode and compatibility.
     result = str(payload.get("result") or payload.get("r") or "").strip()
+    original_result = result
     if result not in {"合格", "不合格", "存疑", "不适用"}:
         raise ValueError("独立规则结果必须是合格、不合格、存疑或不适用")
     filename = str(payload.get("source_file") or payload.get("f") or "").strip()
@@ -230,24 +233,45 @@ def rule_evaluation_from_llm(
             filename = documents[0].filename
         page = page or 1
     confidence = _confidence(payload.get("confidence") if "confidence" in payload else payload.get("q"))
+    downgrade_reasons: list[str] = []
+    if result == "不合格" and confidence < confidence_threshold:
+        result = "存疑"
+        downgrade_reasons.append("confidence_below_threshold")
+    if result == "不合格" and deterministic_result == "合格":
+        result = "存疑"
+        downgrade_reasons.append("deterministic_pass_conflict")
+    if result == "不合格" and bool((feedback_policy or {}).get("downgrade_llm_issue")):
+        result = "存疑"
+        downgrade_reasons.append("local_feedback_false_positive_pattern")
     conclusion = str(payload.get("conclusion") or payload.get("c") or "")
     if evidence_type == "unlocated":
         conclusion = (conclusion or "模型发现疑点") + "（证据未能自动定位，需人工复核）"
+    if downgrade_reasons:
+        conclusion = (conclusion or f"模型判断为{original_result}") + "（已降级为人工复核）"
     evaluation = {
         "task_name": task, "status": result, "conclusion": conclusion,
         "source_file": filename, "source_page": page, "evidence": evidence, "evidence_type": evidence_type,
         "actual": str(payload.get("actual") or ""), "requirement": str(payload.get("requirement") or ""),
         "logic": str(payload.get("logic") or ""), "suggestion": str(payload.get("suggestion") or ""),
         "confidence": confidence,
+        "downgrade_reasons": downgrade_reasons,
     }
     if result not in {"不合格", "存疑"}:
+        return evaluation, None
+    # An unlocated low-confidence doubt remains visible in the per-rule ledger,
+    # but must not inflate the formal or manual finding queue.
+    if result == "存疑" and evidence_type == "unlocated" and confidence < confidence_threshold:
+        evaluation["downgrade_reasons"] = [*downgrade_reasons, "unlocated_low_confidence"]
         return evaluation, None
     finding = Finding(
         "独立规则复核", "Major" if result == "不合格" else "Review", task,
         conclusion or f"独立规则判断为{result}",
         evaluation["actual"], evaluation["requirement"], filename, page or 1, evidence,
         logic=evaluation["logic"], suggestion=evaluation["suggestion"] or "请人工复核并要求供应商补充证据。",
-        confidence=confidence, metadata={"origin": "llm_rule_task", "result": result, "evidence_type": evidence_type},
+        confidence=confidence, metadata={"origin": "llm_rule_task", "result": result, "original_result": original_result,
+            "evidence_type": evidence_type, "downgrade_reasons": downgrade_reasons,
+            "review_priority": "high" if bool((feedback_policy or {}).get("prioritize_review")) else "normal"},
+        rule_code=task, decision_confidence=confidence,
     )
     return evaluation, finding
 

@@ -42,7 +42,11 @@ def compare_value(actual: float, operator: str, expected: float, upper: float | 
 
 
 class AuditEngine:
+    def __init__(self) -> None:
+        self.last_passed_items: set[str] = set()
+
     def audit(self, documents: dict[str, list[ExtractedItem]], requirements: list[Requirement]) -> list[Finding]:
+        self.last_passed_items = set()
         findings: list[Finding] = []
         all_items = [(filename, item) for filename, items in documents.items() for item in items]
         by_key: dict[str, list[tuple[str, ExtractedItem]]] = defaultdict(list)
@@ -53,12 +57,19 @@ class AuditEngine:
             if requirement.operator == "exists":
                 if not candidates:
                     findings.append(self._missing(requirement))
+                else:
+                    self.last_passed_items.add(requirement.item)
                 continue
             if not candidates:
                 continue
+            requirement_failed = False
             for filename, actual in candidates:
                 finding = self._compare(filename, actual, requirement)
-                if finding: findings.append(finding)
+                if finding:
+                    requirement_failed = True
+                    findings.append(finding)
+            if not requirement_failed:
+                self.last_passed_items.add(requirement.item)
         return _dedupe(findings)
 
     def _compare(self, filename: str, actual: ExtractedItem, requirement: Requirement) -> Finding | None:
@@ -112,4 +123,3 @@ def _dedupe(items: list[Finding]) -> list[Finding]:
         key = (item.category, item.item, item.source_file, item.actual)
         if key not in seen: seen.add(key); result.append(item)
     return result
-

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from io import BytesIO
 
 import pandas as pd
@@ -61,9 +62,16 @@ def export_batch(db: ReviewDatabase, batch_id: str) -> bytes:
     )
     rule_evaluations = db.query(
         """SELECT task_index,task_name,status,conclusion,source_file,source_page,evidence,evidence_type,
-                  actual,requirement,logic,suggestion,confidence,error,started_at,completed_at
+                  actual,requirement,logic,suggestion,confidence,error,metadata,started_at,completed_at
            FROM rule_evaluations WHERE batch_id=? ORDER BY task_index""", (batch_id,)
     )
+    def downgrade_reason(finding: dict[str, object]) -> str:
+        try:
+            reasons = json.loads(str(finding.get("metadata") or "{}")).get("downgrade_reasons", [])
+        except (ValueError, TypeError):
+            reasons = []
+        return "；".join(str(reason) for reason in reasons)
+
     rows = [{
         "序号": index, "审核批次": batch["name"], "审核模板": batch.get("template_name") or "",
         "供应商": batch.get("supplier_name") or "",
@@ -72,7 +80,8 @@ def export_batch(db: ReviewDatabase, batch_id: str) -> bytes:
         "要求内容": finding["requirement"], "对应标准": finding["standard_file"],
         "标准页码": finding["standard_page"], "标准条款": finding["standard_clause"],
         "判断逻辑": finding["logic"], "问题描述": finding["description"], "整改建议": finding["suggestion"],
-        "AI置信度": finding["confidence"], "人工状态": finding["status"], "备注": "",
+        "AI置信度": finding["confidence"], "降级原因": downgrade_reason(finding),
+        "人工状态": finding["status"], "备注": "",
     } for index, finding in enumerate(findings, start=1)]
     levels = ("Critical", "Major", "Minor", "Warning", "Review")
     summary = [{"指标": "审核批次", "内容": batch["name"]}, {"指标": "供应商", "内容": batch.get("supplier_name") or "未识别"},
@@ -88,17 +97,17 @@ def export_batch(db: ReviewDatabase, batch_id: str) -> bytes:
         "结论说明": item["conclusion"], "证据文件": item["source_file"], "页码": item["source_page"],
         "证据": item["evidence"], "证据类型": item["evidence_type"], "实际值": item["actual"],
         "要求值": item["requirement"], "判断逻辑": item["logic"], "整改建议": item["suggestion"],
-        "置信度": item["confidence"], "调用错误": item["error"], "开始时间": item["started_at"],
+        "置信度": item["confidence"], "降级原因": downgrade_reason(item), "调用错误": item["error"], "开始时间": item["started_at"],
         "完成时间": item["completed_at"],
     } for item in rule_evaluations]
     output = BytesIO()
     columns = ["序号", "审核批次", "审核模板", "供应商", "问题等级", "问题类别", "文件名称", "页码", "检查项目", "实际内容",
-               "要求内容", "对应标准", "标准页码", "标准条款", "判断逻辑", "问题描述", "整改建议", "AI置信度", "人工状态", "备注"]
+               "要求内容", "对应标准", "标准页码", "标准条款", "判断逻辑", "问题描述", "整改建议", "AI置信度", "降级原因", "人工状态", "备注"]
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         pd.DataFrame(rows, columns=columns).to_excel(writer, sheet_name="问题清单", index=False)
         pd.DataFrame(summary).to_excel(writer, sheet_name="审核汇总", index=False)
         pd.DataFrame(rule_rows, columns=["序号", "审核任务", "结论", "结论说明", "证据文件", "页码", "证据", "证据类型",
-            "实际值", "要求值", "判断逻辑", "整改建议", "置信度", "调用错误", "开始时间", "完成时间"]).to_excel(
+            "实际值", "要求值", "判断逻辑", "整改建议", "置信度", "降级原因", "调用错误", "开始时间", "完成时间"]).to_excel(
                 writer, sheet_name="逐条规则", index=False)
         pd.DataFrame(basis, columns=["文件名称", "类别", "角色", "优先级", "页数", "解析状态", "依据检索"]).to_excel(writer, sheet_name="审核依据", index=False)
         for sheet in writer.book.worksheets:
