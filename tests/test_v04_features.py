@@ -45,6 +45,20 @@ def test_cancel_queued_job_is_immediate(tmp_path: Path) -> None:
     assert db.claim_job() is None
 
 
+def test_cancel_running_job_is_visible_immediately(tmp_path: Path) -> None:
+    db = ReviewDatabase(tmp_path / "review.db")
+    batch_id = db.create_batch(None)
+    assert db.claim_job() is not None
+    db.update_batch(batch_id, status="running")
+
+    assert db.request_cancel(batch_id)
+
+    batch = db.one("SELECT status,stage,cancel_requested FROM review_batches WHERE id=?", (batch_id,))
+    job = db.one("SELECT status FROM jobs WHERE batch_id=?", (batch_id,))
+    assert batch == {"status": "cancelled", "stage": "已取消", "cancel_requested": 1}
+    assert job == {"status": "cancel_requested"}
+
+
 def test_feedback_is_persisted(tmp_path: Path) -> None:
     db = ReviewDatabase(tmp_path / "review.db")
     batch_id = db.create_batch(None)
@@ -74,4 +88,14 @@ def test_trash_can_restore_and_enforces_retention(tmp_path: Path) -> None:
     expired = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(timespec="seconds")
     db.update_batch(batch_id, purge_after=expired)
     db.purge_batch(batch_id)
+    assert db.one("SELECT id FROM review_batches WHERE id=?", (batch_id,)) is None
+
+
+def test_trashed_batch_can_be_force_deleted_before_retention_expires(tmp_path: Path) -> None:
+    db = ReviewDatabase(tmp_path / "review.db")
+    batch_id = db.create_batch(None)
+    db.soft_delete_batch(batch_id)
+
+    db.purge_batch(batch_id, force=True)
+
     assert db.one("SELECT id FROM review_batches WHERE id=?", (batch_id,)) is None

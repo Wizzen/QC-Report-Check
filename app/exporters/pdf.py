@@ -12,7 +12,7 @@ from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import mm
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.cidfonts import UnicodeCIDFont
-from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.pdfbase.ttfonts import TTFont, TTFError
 from reportlab.platypus import (
     CondPageBreak,
     Image,
@@ -45,6 +45,8 @@ SEVERITY_COLORS = {
     "Review": colors.HexColor("#667085"),
 }
 CJK_FONT = "STSong-Light"
+LATIN_FONT = "Helvetica"
+LATIN_BOLD_FONT = "Helvetica-Bold"
 
 
 def export_batch_pdf(db: ReviewDatabase, batch_id: str) -> bytes:
@@ -311,33 +313,61 @@ def _report_image(payload: bytes) -> Image:
 
 
 def _register_fonts() -> None:
-    global CJK_FONT
-    candidates = (
-        Path("C:/Windows/Fonts/simhei.ttf"),
-        Path("C:/Windows/Fonts/msyh.ttc"),
-        Path("/System/Library/Fonts/PingFang.ttc"),
-        Path("/System/Library/Fonts/Hiragino Sans GB.ttc"),
+    global CJK_FONT, LATIN_FONT, LATIN_BOLD_FONT
+
+    # Prefer the native Song typeface on both platforms. Avoid PingFang and
+    # Hiragino here: their macOS TTC files use PostScript/CFF outlines, which
+    # ReportLab's TTFont parser cannot embed and raises TTFError for.
+    cjk_candidates = (
+        Path("C:/Windows/Fonts/simsun.ttc"),
+        Path("C:/Windows/Fonts/simsun.ttf"),
+        Path("/System/Library/Fonts/Supplemental/Songti.ttc"),
+        Path("/System/Library/Fonts/Supplemental/Arial Unicode.ttf"),
+        Path("/usr/share/fonts/truetype/arphic/uming.ttc"),
         Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
     )
+    if _register_truetype("QaqcCJK", cjk_candidates):
+        CJK_FONT = "QaqcCJK"
+    else:
+        if "STSong-Light" not in pdfmetrics.getRegisteredFontNames():
+            pdfmetrics.registerFont(UnicodeCIDFont("STSong-Light"))
+        CJK_FONT = "STSong-Light"
+
+    home_fonts = Path.home() / "Library" / "Fonts"
+    latin_candidates = (
+        Path("C:/Windows/Fonts/calibri.ttf"),
+        home_fonts / "Calibri.ttf",
+        Path("/Library/Fonts/Microsoft/Calibri.ttf"),
+    )
+    latin_bold_candidates = (
+        Path("C:/Windows/Fonts/calibrib.ttf"),
+        home_fonts / "Calibri Bold.ttf",
+        Path("/Library/Fonts/Microsoft/Calibri Bold.ttf"),
+    )
+    LATIN_FONT = "QaqcLatin" if _register_truetype("QaqcLatin", latin_candidates) else "Helvetica"
+    LATIN_BOLD_FONT = (
+        "QaqcLatinBold" if _register_truetype("QaqcLatinBold", latin_bold_candidates) else "Helvetica-Bold"
+    )
+
+
+def _register_truetype(alias: str, candidates: tuple[Path, ...]) -> bool:
+    if alias in pdfmetrics.getRegisteredFontNames():
+        return True
     for candidate in candidates:
         if not candidate.is_file():
             continue
         try:
-            if "QaqcCJK" not in pdfmetrics.getRegisteredFontNames():
-                pdfmetrics.registerFont(TTFont("QaqcCJK", str(candidate), subfontIndex=0))
-            CJK_FONT = "QaqcCJK"
-            return
-        except (OSError, ValueError):
+            pdfmetrics.registerFont(TTFont(alias, str(candidate), subfontIndex=0))
+            return True
+        except (OSError, ValueError, TTFError):
             continue
-    if "STSong-Light" not in pdfmetrics.getRegisteredFontNames():
-        pdfmetrics.registerFont(UnicodeCIDFont("STSong-Light"))
-    CJK_FONT = "STSong-Light"
+    return False
 
 
 def _styles() -> dict[str, ParagraphStyle]:
     base = getSampleStyleSheet()
     return {
-        "eyebrow": ParagraphStyle("eyebrow", parent=base["Normal"], fontName="Helvetica-Bold", fontSize=8,
+        "eyebrow": ParagraphStyle("eyebrow", parent=base["Normal"], fontName=LATIN_BOLD_FONT, fontSize=8,
                                   leading=10, textColor=BLUE, tracking=1.5),
         "title": ParagraphStyle("title", parent=base["Title"], fontName=CJK_FONT, fontSize=25,
                                 leading=31, textColor=NAVY, alignment=TA_LEFT),
@@ -363,11 +393,11 @@ def _styles() -> dict[str, ParagraphStyle]:
                                      leading=11, textColor=WHITE),
         "table_cell": ParagraphStyle("table_cell", parent=base["Normal"], fontName=CJK_FONT, fontSize=7.8,
                                      leading=11, textColor=INK),
-        "number": ParagraphStyle("number", parent=base["Normal"], fontName="Helvetica-Bold", fontSize=10,
+        "number": ParagraphStyle("number", parent=base["Normal"], fontName=LATIN_BOLD_FONT, fontSize=10,
                                  leading=12, textColor=WHITE, alignment=TA_CENTER),
         "finding_title": ParagraphStyle("finding_title", parent=base["Normal"], fontName=CJK_FONT, fontSize=12,
                                         leading=15, textColor=NAVY),
-        "severity": ParagraphStyle("severity", parent=base["Normal"], fontName="Helvetica-Bold", fontSize=8,
+        "severity": ParagraphStyle("severity", parent=base["Normal"], fontName=LATIN_BOLD_FONT, fontSize=8,
                                    leading=10, textColor=WHITE, alignment=TA_CENTER),
         "detail_label": ParagraphStyle("detail_label", parent=base["Normal"], fontName=CJK_FONT, fontSize=8.3,
                                        leading=11, textColor=BLUE),

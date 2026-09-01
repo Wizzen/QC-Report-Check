@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS review_batches (
   id TEXT PRIMARY KEY, name TEXT NOT NULL, template_id INTEGER,
   supplier_name TEXT NOT NULL DEFAULT '',
   review_mode TEXT NOT NULL DEFAULT 'adaptive',
+  llm_concurrency INTEGER NOT NULL DEFAULT 0,
   status TEXT NOT NULL DEFAULT 'queued', stage TEXT NOT NULL DEFAULT '等待处理',
   progress INTEGER NOT NULL DEFAULT 0, current_file TEXT NOT NULL DEFAULT '',
   activity TEXT NOT NULL DEFAULT '任务已进入本地队列', resource TEXT NOT NULL DEFAULT 'SQLite 本地任务队列',
@@ -226,6 +227,7 @@ class ReviewDatabase:
             for name, declaration in {
                 "supplier_name": "TEXT NOT NULL DEFAULT ''",
                 "review_mode": "TEXT NOT NULL DEFAULT 'adaptive'",
+                "llm_concurrency": "INTEGER NOT NULL DEFAULT 0",
                 "activity": "TEXT NOT NULL DEFAULT '任务已进入本地队列'",
                 "resource": "TEXT NOT NULL DEFAULT 'SQLite 本地任务队列'",
                 "heartbeat_at": "TEXT NOT NULL DEFAULT ''",
@@ -297,7 +299,8 @@ class ReviewDatabase:
         rows = self.query(sql, params)
         return rows[0] if rows else None
 
-    def create_batch(self, template_id: int | None, review_mode: str = "adaptive") -> str:
+    def create_batch(self, template_id: int | None, review_mode: str = "adaptive",
+                     llm_concurrency: int = 0) -> str:
         batch_id = str(uuid.uuid4())
         now = utcnow()
         # Seconds make repeated uploads visibly distinct while the UUID remains the
@@ -308,15 +311,25 @@ class ReviewDatabase:
         ) if template_id else None
         snapshot = json.dumps(template or {}, ensure_ascii=False)
         review_mode = review_mode if review_mode in {"adaptive", "deep"} else "adaptive"
+        llm_concurrency = max(0, min(4, int(llm_concurrency or 0)))
         self.execute(
-            "INSERT INTO review_batches(id,name,template_id,review_mode,template_snapshot,heartbeat_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
-            (batch_id, name, template_id, review_mode, snapshot, now, now, now),
+            """INSERT INTO review_batches(id,name,template_id,review_mode,llm_concurrency,template_snapshot,
+               heartbeat_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)""",
+            (batch_id, name, template_id, review_mode, llm_concurrency, snapshot, now, now, now),
         )
         self.execute(
             "INSERT INTO jobs(id,batch_id,created_at,updated_at) VALUES(?,?,?,?)",
             (str(uuid.uuid4()), batch_id, now, now),
         )
         return batch_id
+
+    def delete_template(self, template_id: int) -> None:
+        template = self.one("SELECT name,is_default FROM audit_templates WHERE id=?", (template_id,))
+        if not template:
+            raise ValueError("模板不存在或已被删除")
+        if template["is_default"]:
+            raise ValueError("默认模板不能直接删除；请先将其他模板设为默认模板")
+        self.execute("DELETE FROM audit_templates WHERE id=?", (template_id,))
 
     def add_document(self, *, library: str, kind: str, original_name: str, stored_path: str,
                      sha256: str, mime_type: str = "") -> str:
@@ -375,8 +388,13 @@ class ReviewDatabase:
                               cancelled_at=now, activity="任务在开始前已取消", resource="本机任务队列")
         else:
             self.execute("UPDATE jobs SET status='cancel_requested',updated_at=? WHERE batch_id=?", (now, batch_id))
-            self.update_batch(batch_id, status="cancel_requested", cancel_requested=1,
-                              stage="正在停止", activity="等待当前安全检查点后停止", resource="本地 worker")
+            # Cancellation is final from the user's perspective as soon as it is
+            # accepted: process_batch checks this flag before publishing results.
+            # An already-running HTTP request may finish in the background, but
+            # must not keep the UI stuck on "正在停止" until its timeout expires.
+            self.update_batch(batch_id, status="cancelled", cancel_requested=1,
+                              stage="已取消", cancelled_at=now,
+                              activity="停止操作已生效；正在释放后台资源", resource="本地 worker")
         return True
 
     def is_cancel_requested(self, batch_id: str) -> bool:
@@ -398,12 +416,12 @@ class ReviewDatabase:
     def restore_batch(self, batch_id: str) -> None:
         self.update_batch(batch_id, deleted_at="", purge_after="")
 
-    def purge_batch(self, batch_id: str) -> list[dict[str, Any]]:
+    def purge_batch(self, batch_id: str, force: bool = False) -> list[dict[str, Any]]:
         """Permanently remove a trashed batch and return private documents for filesystem cleanup."""
         batch = self.one("SELECT deleted_at,purge_after FROM review_batches WHERE id=?", (batch_id,))
         if not batch or not batch["deleted_at"]:
             raise ValueError("仅回收站中的审核记录可以永久删除")
-        if batch["purge_after"] and datetime.fromisoformat(batch["purge_after"]) > datetime.now(timezone.utc):
+        if not force and batch["purge_after"] and datetime.fromisoformat(batch["purge_after"]) > datetime.now(timezone.utc):
             raise ValueError("回收站保留期尚未结束，当前只能恢复记录")
         private = self.query(
             """SELECT d.* FROM batch_documents bd JOIN documents d ON d.id=bd.document_id
@@ -441,12 +459,14 @@ class ReviewDatabase:
         with self.connect() as connection:
             cancelled = connection.execute(
                 """SELECT j.batch_id FROM jobs j JOIN review_batches b ON b.id=j.batch_id
-                   WHERE b.cancel_requested=1 AND b.status='cancel_requested'"""
+                   WHERE b.cancel_requested=1 AND b.status IN ('cancel_requested','cancelled')
+                     AND j.status='cancel_requested'"""
             ).fetchall()
             if cancelled:
                 connection.execute(
                     """UPDATE jobs SET status='cancelled',updated_at=? WHERE batch_id IN
-                       (SELECT id FROM review_batches WHERE cancel_requested=1 AND status='cancel_requested')""", (now,)
+                       (SELECT id FROM review_batches WHERE cancel_requested=1
+                        AND status IN ('cancel_requested','cancelled'))""", (now,)
                 )
                 connection.executemany(
                     """UPDATE review_batches SET status='cancelled',stage='已取消',cancelled_at=?,

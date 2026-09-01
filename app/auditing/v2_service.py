@@ -6,7 +6,7 @@ import logging
 import mimetypes
 import re
 import shutil
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from io import BytesIO
 from pathlib import Path
 from typing import BinaryIO, Iterable
@@ -56,20 +56,30 @@ class ReviewService:
 
     def _ensure_fastener_template(self) -> None:
         row = self.db.one("SELECT id,required_items,review_instructions FROM audit_templates WHERE name=?", (FASTENER_TEMPLATE_NAME,))
+        if not row:
+            # Migrate an older branded display name without retaining customer
+            # or supplier names in source code or newly initialized databases.
+            row = self.db.one(
+                "SELECT id,required_items,review_instructions FROM audit_templates "
+                "WHERE name LIKE '%紧固件%质量文件%审核%' ORDER BY id LIMIT 1"
+            )
+            if row:
+                self.db.execute("UPDATE audit_templates SET name=? WHERE id=?", (FASTENER_TEMPLATE_NAME, row["id"]))
         if row:
             # An explicitly saved all-disabled table is still a valid user configuration.
             # Only seed the built-in rows when the template truly has no rows at all.
             required_items = row["required_items"] if parse_template_tasks(row["required_items"]) else json.dumps(FASTENER_REQUIRED_CHECKS, ensure_ascii=False)
-            instructions = row["review_instructions"] or FASTENER_REVIEW_INSTRUCTIONS
+            instructions = FASTENER_REVIEW_INSTRUCTIONS
             self.db.execute(
-                "UPDATE audit_templates SET review_instructions=?,required_document_types=?,required_items=? WHERE id=?",
-                (instructions, json.dumps(["COC", "COI/MTR"], ensure_ascii=False), required_items, row["id"]),
+                "UPDATE audit_templates SET description=?,review_instructions=?,required_document_types=?,required_items=? WHERE id=?",
+                ("按文件/WDC关系、表格实测数据和逐页证据审核紧固件质量文件。", instructions,
+                 json.dumps(["COC", "COI/MTR"], ensure_ascii=False), required_items, row["id"]),
             )
             return
         self.db.execute(
             """INSERT INTO audit_templates(name,description,required_document_types,required_items,review_instructions,
                enabled,is_default,created_at) VALUES(?,?,?,?,?,1,0,?)""",
-            (FASTENER_TEMPLATE_NAME, "按文件/WDC关系、表格实测数据和逐页证据审核通用紧固件质量文件。",
+            (FASTENER_TEMPLATE_NAME, "按文件/WDC关系、表格实测数据和逐页证据审核紧固件质量文件。",
              json.dumps(["COC", "COI/MTR"], ensure_ascii=False),
              json.dumps(FASTENER_REQUIRED_CHECKS, ensure_ascii=False), FASTENER_REVIEW_INSTRUCTIONS, utcnow()),
         )
@@ -111,12 +121,12 @@ class ReviewService:
 
     def create_review(self, template_id: int | None, selected_basis: list[str],
                       supplier_files: Iterable[object], supplemental_files: Iterable[object],
-                      review_mode: str = "adaptive") -> str:
+                      review_mode: str = "adaptive", llm_concurrency: int = 0) -> str:
         supplier_files = list(supplier_files)
         supplemental_files = list(supplemental_files)
         if not supplier_files:
             raise ValueError("至少需要上传一份供应商质量文件")
-        batch_id = self.db.create_batch(template_id, review_mode)
+        batch_id = self.db.create_batch(template_id, review_mode, llm_concurrency)
         destination = self.uploads / batch_id
         for uploaded in supplier_files:
             document_id = self._save_uploaded(uploaded, "supplier", "supplier", destination)
@@ -132,17 +142,22 @@ class ReviewService:
         return batch_id
 
     def retry_review(self, source_batch_id: str) -> str:
-        source = self.db.one("SELECT template_id,review_mode FROM review_batches WHERE id=?", (source_batch_id,))
+        source = self.db.one(
+            "SELECT template_id,review_mode,llm_concurrency FROM review_batches WHERE id=?", (source_batch_id,)
+        )
         if not source:
             raise ValueError("原审核批次不存在")
-        batch_id = self.db.create_batch(source["template_id"], str(source.get("review_mode") or "adaptive"))
+        batch_id = self.db.create_batch(
+            source["template_id"], str(source.get("review_mode") or "adaptive"),
+            int(source.get("llm_concurrency") or 0),
+        )
         rows = self.db.query("SELECT document_id,role,priority FROM batch_documents WHERE batch_id=?", (source_batch_id,))
         for row in rows:
             self.db.attach_document(batch_id, row["document_id"], row["role"], row["priority"])
         return batch_id
 
-    def purge_review(self, batch_id: str) -> None:
-        private = self.db.purge_batch(batch_id)
+    def purge_review(self, batch_id: str, force: bool = False) -> None:
+        private = self.db.purge_batch(batch_id, force=force)
         for row in private:
             path = Path(str(row["stored_path"]))
             if path.is_file():
@@ -351,7 +366,10 @@ class ReviewService:
         requirements = [Requirement(row["item"], row["operator"], _number_or_text(row["value"]),
             _optional_float(row["upper_value"]), row["unit"], row["raw"], row["source_file"], row["source_page"],
             row["clause"], bool(row["required"])) for row in rule_rows]
-        batch = self.db.one("SELECT template_id,template_snapshot,review_mode FROM review_batches WHERE id=?", (batch_id,))
+        batch = self.db.one(
+            "SELECT template_id,template_snapshot,review_mode,llm_concurrency FROM review_batches WHERE id=?",
+            (batch_id,),
+        )
         template = self.db.one("SELECT * FROM audit_templates WHERE id=?", (batch["template_id"],)) if batch and batch["template_id"] else None
         try:
             snapshot = json.loads(str(batch.get("template_snapshot") or "{}")) if batch else {}
@@ -378,7 +396,10 @@ class ReviewService:
         self._check_cancel(batch_id)
         if not documents:
             return findings
-        batch = self.db.one("SELECT template_id,template_snapshot,review_mode FROM review_batches WHERE id=?", (batch_id,))
+        batch = self.db.one(
+            "SELECT template_id,template_snapshot,review_mode,llm_concurrency FROM review_batches WHERE id=?",
+            (batch_id,),
+        )
         template = self.db.one("SELECT required_items,review_instructions FROM audit_templates WHERE id=?", (batch["template_id"],)) if batch and batch["template_id"] else None
         try:
             snapshot = json.loads(str(batch.get("template_snapshot") or "{}")) if batch else {}
@@ -422,11 +443,14 @@ class ReviewService:
                 "待人工确认", "Review", "独立规则审核未执行", message,
                 requirement="配置模型名称，或确保 /models 返回可用模型",
             )]
-        concurrency = min(len(tasks), max(1, settings.llm_concurrency))
+        requested_concurrency = int(batch.get("llm_concurrency") or 0) if batch else 0
+        provider_limit = client.generation_concurrency_limit()
+        concurrency = min(len(tasks), provider_limit, max(1, requested_concurrency or settings.llm_concurrency))
         llm_resource = _resource("LLM", settings.llm_base_url, resolved_model)
         mode_label = "自适应审核" if review_mode == "adaptive" else "思考模式深度复核"
+        execution_label = "安全单路" if provider_limit == 1 else f"并发 {concurrency}"
         self._activity(
-            batch_id, activity=f"{mode_label}：准备并发执行 {len(tasks)} 个独立 LLM 审核任务（并发 {concurrency}）",
+            batch_id, activity=f"{mode_label}：准备执行 {len(tasks)} 个独立 LLM 审核任务（{execution_label}）",
             resource=llm_resource,
         )
         discovered: list[Finding] = []
@@ -438,8 +462,10 @@ class ReviewService:
         )
 
         def run_task(index: int, task: str) -> tuple[int, str, dict[str, object], Finding | None]:
+            self._check_cancel(batch_id)
             task_documents = _rule_evidence_documents(documents, task, max_chars=8_000)
             prompt = build_rule_task_prompt(task, task_documents, instructions, findings, basis)
+            self._check_cancel(batch_id)
             if review_mode == "deep":
                 payload = client.generate_json(
                     prompt, retries=0, timeout_seconds=settings.llm_timeout_seconds,
@@ -461,40 +487,61 @@ class ReviewService:
             evaluation, finding = rule_evaluation_from_llm(payload, task, documents)
             return index, task, evaluation, finding
 
-        with ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="audit-rule") as executor:
+        executor = ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="audit-rule")
+        cancelled = False
+        try:
             future_tasks = {
                 executor.submit(run_task, index, task): (index, task) for index, task in enumerate(tasks, 1)
             }
-            for completed, future in enumerate(as_completed(future_tasks), 1):
+            pending = set(future_tasks)
+            completed = 0
+            while pending:
+                # Do not block on as_completed while an LLM request is running.
+                # Polling the cancellation flag keeps the stop button responsive.
+                done, pending = wait(pending, timeout=0.25, return_when=FIRST_COMPLETED)
                 self._check_cancel(batch_id)
-                index, task = future_tasks[future]
-                try:
-                    _, _, evaluation, finding = future.result()
-                except Exception as exc:
-                    failed_tasks.append(task)
-                    message = str(exc)[:500] or type(exc).__name__
-                    LOGGER.warning("独立规则任务失败 %s：%s", task, type(exc).__name__)
+                for future in done:
+                    completed += 1
+                    index, task = future_tasks[future]
+                    try:
+                        _, _, evaluation, finding = future.result()
+                    except ReviewCancelled:
+                        raise
+                    except Exception as exc:
+                        failed_tasks.append(task)
+                        message = str(exc)[:500] or type(exc).__name__
+                        LOGGER.warning("独立规则任务失败 %s：%s", task, type(exc).__name__)
+                        self.db.execute(
+                            "UPDATE rule_evaluations SET status='调用失败',error=?,completed_at=? WHERE batch_id=? AND task_index=?",
+                            (message, utcnow(), batch_id, index),
+                        )
+                    else:
+                        self.db.execute(
+                            """UPDATE rule_evaluations SET status=?,conclusion=?,source_file=?,source_page=?,evidence=?,evidence_type=?,
+                               actual=?,requirement=?,logic=?,suggestion=?,confidence=?,completed_at=? WHERE batch_id=? AND task_index=?""",
+                            (evaluation["status"], evaluation["conclusion"], evaluation["source_file"], evaluation["source_page"],
+                             evaluation["evidence"], evaluation["evidence_type"], evaluation["actual"], evaluation["requirement"],
+                             evaluation["logic"], evaluation["suggestion"], evaluation["confidence"], utcnow(), batch_id, index),
+                        )
+                        if finding:
+                            discovered.append(finding)
                     self.db.execute(
-                        "UPDATE rule_evaluations SET status='调用失败',error=?,completed_at=? WHERE batch_id=? AND task_index=?",
-                        (message, utcnow(), batch_id, index),
+                        "UPDATE jobs SET updated_at=? WHERE batch_id=?", (utcnow(), batch_id)
                     )
-                else:
-                    self.db.execute(
-                        """UPDATE rule_evaluations SET status=?,conclusion=?,source_file=?,source_page=?,evidence=?,evidence_type=?,
-                           actual=?,requirement=?,logic=?,suggestion=?,confidence=?,completed_at=? WHERE batch_id=? AND task_index=?""",
-                        (evaluation["status"], evaluation["conclusion"], evaluation["source_file"], evaluation["source_page"],
-                         evaluation["evidence"], evaluation["evidence_type"], evaluation["actual"], evaluation["requirement"],
-                         evaluation["logic"], evaluation["suggestion"], evaluation["confidence"], utcnow(), batch_id, index),
+                    self._activity(
+                        batch_id, progress=82 + int(12 * completed / max(1, len(tasks))),
+                        activity=f"{mode_label}已完成 {completed}/{len(tasks)} 条；刚完成：{task}", resource=llm_resource,
                     )
-                    if finding:
-                        discovered.append(finding)
-                self.db.execute(
-                    "UPDATE jobs SET updated_at=? WHERE batch_id=?", (utcnow(), batch_id)
-                )
-                self._activity(
-                    batch_id, progress=82 + int(12 * completed / max(1, len(tasks))),
-                    activity=f"{mode_label}已完成 {completed}/{len(tasks)} 条；刚完成：{task}", resource=llm_resource,
-                )
+        except ReviewCancelled:
+            cancelled = True
+            for future in future_tasks:
+                future.cancel()
+            raise
+        finally:
+            # Waiting here was the main source of the long stop delay. Running
+            # requests are allowed to unwind in the background; queued rules are
+            # cancelled and no result can be published after the DB cancel flag.
+            executor.shutdown(wait=not cancelled, cancel_futures=cancelled)
         if failed_tasks:
             discovered.append(Finding(
                 "待人工确认", "Review", "部分独立规则未完成",

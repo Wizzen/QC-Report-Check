@@ -3,13 +3,31 @@ from __future__ import annotations
 import hashlib
 from io import BytesIO
 from pathlib import Path
+from unittest.mock import patch
 
 import pymupdf
 from openpyxl import load_workbook
+from reportlab.pdfbase.ttfonts import TTFError
 
 from app.database import ReviewDatabase
 from app.database.v2 import utcnow
 from app.exporters import export_batch, export_batch_pdf
+from app.exporters.pdf import _register_truetype
+
+
+def test_pdf_font_registration_skips_unsupported_ttc(tmp_path: Path) -> None:
+    unsupported = tmp_path / "unsupported.ttc"
+    supported = tmp_path / "supported.ttf"
+    unsupported.touch()
+    supported.touch()
+
+    with patch("app.exporters.pdf.pdfmetrics.getRegisteredFontNames", return_value=[]), \
+         patch("app.exporters.pdf.TTFont", side_effect=[TTFError("PostScript outlines"), object()]) as ttfont, \
+         patch("app.exporters.pdf.pdfmetrics.registerFont") as register:
+        assert _register_truetype("TestCrossPlatformFont", (unsupported, supported)) is True
+
+    assert ttfont.call_count == 2
+    register.assert_called_once()
 
 
 def test_pdf_report_contains_summary_details_and_only_matched_screenshot(tmp_path: Path) -> None:

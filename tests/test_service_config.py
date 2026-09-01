@@ -200,6 +200,42 @@ def test_llm_non_retryable_422_fails_once(tmp_path: Path) -> None:
     assert request.call_count == 1
 
 
+def test_project_models_tuple_shape_500_retries_once_in_serial_mode(tmp_path: Path) -> None:
+    settings = _store(tmp_path).save({"llm_model": "Qwen3.8-27B-4bit"})
+    failed = Mock(status_code=500, reason="Internal Server Error",
+                  text='{"detail":"Generation failed: \'tuple\' object has no attribute \'shape\'"}')
+    failed.raise_for_status.side_effect = __import__("requests").HTTPError(response=failed)
+    succeeded = Mock(status_code=200)
+    succeeded.raise_for_status.return_value = None
+    succeeded.json.return_value = {"choices": [{"message": {"content": '{"ok": true}'}}]}
+    client = LLMClient(settings)
+
+    with patch.object(client, "_uses_lm_studio_native_api", return_value=False), \
+         patch("app.integrations.clients.requests.post", side_effect=[failed, succeeded]) as request:
+        result = client.generate_json("test", retries=0, thinking=False)
+
+    assert result == {"ok": True}
+    assert request.call_count == 2
+    assert client._force_serial_generation is True
+
+
+def test_project_models_qwen38_is_serialized_before_first_generation(tmp_path: Path) -> None:
+    settings = _store(tmp_path).save({"llm_model": "Qwen3.8-27B-4bit"})
+    health = Mock(status_code=200)
+    health.json.return_value = {
+        "proxy_model": "/models/Qwen3.8-27B-4bit",
+        "continuous_batching_enabled": True,
+    }
+    client = LLMClient(settings)
+
+    with patch("app.integrations.clients.requests.get", return_value=health) as request:
+        limit = client.generation_concurrency_limit()
+
+    assert limit == 1
+    assert client._force_serial_generation is True
+    assert request.call_args.args[0] == "http://127.0.0.1:8080/health"
+
+
 def test_llm_connection_test_has_short_bounded_probe(tmp_path: Path) -> None:
     settings = _store(tmp_path).save({"llm_model": "slow-model"})
     client = LLMClient(settings)

@@ -44,6 +44,9 @@ class LLMClient:
         self.settings = settings
         self._resolved_model = settings.llm_model.strip()
         self._model_lock = Lock()
+        self._generation_lock = Lock()
+        self._force_serial_generation = False
+        self._project_models: bool | None = None
         self._lm_studio_native: bool | None = None
         ensure_url_allowed(settings.llm_base_url, settings.allow_remote)
 
@@ -79,6 +82,42 @@ class LLMClient:
         except (requests.RequestException, ValueError, TypeError):
             self._lm_studio_native = False
         return bool(self._lm_studio_native)
+
+    def generation_concurrency_limit(self) -> int:
+        """Return a safe generation limit for the configured local backend.
+
+        The Project Models MLX proxy currently reports continuous batching but
+        Qwen3.8 fails inside that path with ``tuple.shape`` when two generations
+        overlap. Detect the proxy before submitting audit tasks so the first
+        request is serialized instead of waiting for an HTTP 500 to downgrade.
+        """
+        if self._project_models is None:
+            model_hint = self.settings.llm_model.casefold()
+            # Limit probing to the affected model family. This avoids adding a
+            # provider-detection request to unrelated OpenAI-compatible APIs.
+            if "qwen3.8" not in model_hint:
+                self._project_models = False
+            else:
+                endpoint = f"{self._native_base_url()}/health"
+                try:
+                    response = requests.get(
+                        endpoint, headers=_headers(self.settings.llm_api_key), timeout=2,
+                        **_network_options(endpoint),
+                    )
+                    body = response.json() if response.status_code == 200 else {}
+                    self._project_models = bool(
+                        isinstance(body, dict)
+                        and "proxy_model" in body
+                        and "continuous_batching_enabled" in body
+                    )
+                except (requests.RequestException, ValueError, TypeError):
+                    # The exact affected Qwen3.8 configuration should fail safe
+                    # even if /health is briefly unavailable during model load.
+                    self._project_models = True
+        if self._project_models:
+            self._force_serial_generation = True
+            return 1
+        return 2
 
     def _generate_lm_studio_json(self, prompt: str, model: str, thinking: bool | str,
                                  timeout_seconds: int, max_tokens: int | None) -> dict[str, Any]:
@@ -220,7 +259,10 @@ class LLMClient:
                       max_tokens: int | None = None, thinking: bool | str | None = None) -> dict[str, Any]:
         last_error: Exception | None = None
         last_detail = ""
-        for attempt in range(retries + 1):
+        attempt = 0
+        max_attempts = retries + 1
+        serial_recovery_added = False
+        while attempt < max_attempts:
             try:
                 model = self.resolve_model()
                 request_prompt = prompt + ("\n只输出一个 JSON 对象。" if attempt else "")
@@ -243,13 +285,18 @@ class LLMClient:
                     }
                 if max_tokens is not None:
                     payload["max_tokens"] = max_tokens
-                response = requests.post(
-                    f"{self.settings.llm_base_url}/chat/completions",
-                    headers=_headers(self.settings.llm_api_key),
-                    json=payload,
-                    timeout=timeout_seconds,
+                request_options = {
+                    "headers": _headers(self.settings.llm_api_key),
+                    "json": payload,
+                    "timeout": timeout_seconds,
                     **_network_options(self.settings.llm_base_url),
-                )
+                }
+                endpoint = f"{self.settings.llm_base_url}/chat/completions"
+                if self._force_serial_generation:
+                    with self._generation_lock:
+                        response = requests.post(endpoint, **request_options)
+                else:
+                    response = requests.post(endpoint, **request_options)
                 response.raise_for_status()
                 body = response.json()
                 if isinstance(body.get("error"), dict):
@@ -272,11 +319,18 @@ class LLMClient:
                 if isinstance(exc, requests.HTTPError) and exc.response is not None:
                     body = exc.response.text.strip().replace("\n", " ")[:240]
                     detail = f"HTTP {exc.response.status_code}: {body or exc.response.reason}"
+                    if exc.response.status_code == 500 and _is_project_models_batch_failure(body):
+                        self._force_serial_generation = True
+                        if not serial_recovery_added:
+                            max_attempts += 1
+                            serial_recovery_added = True
+                        LOGGER.warning("Project Models 连续批处理异常，后续请求自动降为串行")
                 LOGGER.warning("LLM JSON 响应无效（第 %s 次）: %s", attempt + 1, detail)
                 last_detail = detail
                 if isinstance(exc, requests.HTTPError) and exc.response is not None \
                         and exc.response.status_code in {400, 401, 403, 404, 422}:
                     break
+            attempt += 1
         if last_detail:
             message = last_detail
         elif isinstance(last_error, Exception) and str(last_error):
@@ -286,6 +340,11 @@ class LLMClient:
         else:
             message = "未知错误"
         raise RuntimeError(f"LLM 未返回有效 JSON：{message}")
+
+
+def _is_project_models_batch_failure(body: str) -> bool:
+    normalized = body.casefold()
+    return "tuple" in normalized and "shape" in normalized and "generation failed" in normalized
 
 
 class EmbeddingClient:

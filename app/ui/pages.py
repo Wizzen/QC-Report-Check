@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import inspect
 import json
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -36,11 +37,27 @@ def start_review_page() -> None:
     )
     review_mode = "deep" if review_mode_label == "思考模式深度复核" else "adaptive"
     if review_mode == "adaptive":
-        st.caption("每个必检项只调用一次模型，使用紧凑 JSON；无法定位的证据自动转人工复核。推荐 LM Studio 使用单路调用。")
+        st.caption("每个必检项只调用一次模型，使用紧凑 JSON；无法定位的证据自动转人工复核。服务支持连续批处理时可启用双路并行。")
     else:
         st.caption("每一条必检项都启用思考模式，速度较慢，并会占用更多上下文和显存。")
         if "qwen3.5-4b" in settings.llm_model.casefold():
             st.warning("当前 qwen3.5-4b 的完整思考实测可能超过 300 秒。建议本机日常审核选择“自适应审核”。", icon=":material/timer:")
+    project_models_safe_mode = "qwen3.8" in settings.llm_model.casefold()
+    parallel_enabled = st.toggle(
+        "启用并行 LLM 审核", value=False if project_models_safe_mode else settings.llm_concurrency > 1,
+        key="review_parallel_enabled", disabled=project_models_safe_mode,
+        help="Project Models 的 Qwen3.8 连续批处理当前不稳定，已自动锁定安全单路。" if project_models_safe_mode
+        else "只并行执行彼此独立的模板规则；文件解析、确定性规则与结果写入仍按安全顺序执行。",
+    )
+    if project_models_safe_mode:
+        review_concurrency = 1
+        st.caption("已识别 Project Models Qwen3.8：自动使用安全单路，避免生成服务出现 tuple.shape HTTP 500。")
+    elif parallel_enabled:
+        review_concurrency = 2
+        st.caption("本次会同时执行最多 2 条独立规则。")
+    else:
+        review_concurrency = 1
+        st.caption("本次按单路调用执行，稳定性最高。")
     basis = ctx.db.query("SELECT id,original_name,document_kind FROM documents WHERE library_code='basis' AND parse_status='completed' ORDER BY created_at DESC")
     built_in_label = f"{chosen_name} · 内置模板规则（自动启用）"
     basis_options = {built_in_label: None, **{
@@ -74,9 +91,20 @@ def start_review_page() -> None:
             st.error("请至少上传一份供应商质量文件。", icon=":material/error:")
         else:
             try:
-                batch_id = ctx.service.create_review(
-                    template_id, selected_ids, supplier_files, supplemental or [], review_mode
-                )
+                create_parameters = inspect.signature(ctx.service.create_review).parameters
+                if "llm_concurrency" in create_parameters:
+                    batch_id = ctx.service.create_review(
+                        template_id, selected_ids, supplier_files, supplemental or [],
+                        review_mode=review_mode, llm_concurrency=review_concurrency,
+                    )
+                else:
+                    # Streamlit may retain a ReviewService instance created before
+                    # a hot reload. Preserve the selected concurrency globally for
+                    # that legacy instance and use its older method signature.
+                    ctx.config_store.save({"llm_concurrency": review_concurrency})
+                    batch_id = ctx.service.create_review(
+                        template_id, selected_ids, supplier_files, supplemental or [], review_mode=review_mode
+                    )
                 st.session_state["active_batch"] = batch_id
                 st.toast("审核任务已创建", icon=":material/check_circle:")
                 st.session_state["record_batch"] = batch_id
@@ -103,7 +131,11 @@ def batch_status_card(batch_id: str) -> None:
             st.subheader(batch["name"])
             st.badge(_status_label(batch["status"]), color=_status_color(batch["status"]))
         st.caption(f"供应商：{batch.get('supplier_name') or ('正在根据 OCR/LLM 识别' if batch['status'] in {'queued', 'running'} else '未识别')}")
-        st.caption(f"审核方式：{'思考模式深度复核' if batch.get('review_mode') == 'deep' else '自适应审核'}")
+        concurrency = max(1, int(batch.get("llm_concurrency") or 1))
+        st.caption(
+            f"审核方式：{'思考模式深度复核' if batch.get('review_mode') == 'deep' else '自适应审核'}"
+            f" · LLM {'并行' if concurrency > 1 else '单路'} {concurrency}"
+        )
         st.progress(int(batch["progress"]), text=f"{batch['stage']} {('· ' + batch['current_file']) if batch['current_file'] else ''}")
         age = _heartbeat_age(batch.get("heartbeat_at") or batch.get("updated_at"))
         activity = batch.get("activity") or "等待 worker 更新当前操作"
@@ -117,7 +149,7 @@ def batch_status_card(batch_id: str) -> None:
         if batch["status"] in {"queued", "running", "cancel_requested"}:
             if st.button("停止审核", icon=":material/stop_circle:", key=f"cancel_{batch_id}", type="secondary"):
                 if ctx.db.request_cancel(batch_id):
-                    st.toast("停止请求已提交", icon=":material/stop_circle:")
+                    st.toast("审核已停止，正在释放后台资源", icon=":material/stop_circle:")
                     st.rerun(scope="fragment")
         if batch["status"] == "failed":
             st.error(batch["error"] or "处理失败")
@@ -141,34 +173,42 @@ def batch_status_card(batch_id: str) -> None:
 def review_records_page() -> None:
     ctx = get_context()
     _section_header("审核中心", "从批次总览进入问题、原文件、处理过程和导出；供应商档案已经整合到每个批次中。")
-    all_batches = ctx.db.query(
+    active_batches = ctx.db.query(
         """SELECT b.*,t.name template_name,
            (SELECT COUNT(*) FROM findings f WHERE f.batch_id=b.id) finding_count,
            (SELECT COUNT(*) FROM findings f WHERE f.batch_id=b.id AND f.severity IN ('Critical','Major')) major_count,
            (SELECT COUNT(*) FROM findings f WHERE f.batch_id=b.id AND f.severity='Review' AND f.status='AI发现') review_count
-           FROM review_batches b LEFT JOIN audit_templates t ON t.id=b.template_id ORDER BY b.created_at DESC"""
+           FROM review_batches b LEFT JOIN audit_templates t ON t.id=b.template_id
+           WHERE b.deleted_at='' ORDER BY b.created_at DESC"""
     )
-    all_tasks = ctx.db.query(
+    active_tasks = ctx.db.query(
         """SELECT j.id,j.batch_id,j.status job_status,j.attempts,j.locked_at,j.error job_error,
                   j.created_at,j.updated_at,b.name,b.status batch_status,b.stage,b.progress,b.activity,
                   b.resource,b.heartbeat_at,b.supplier_name,b.deleted_at,t.name template_name
            FROM jobs j JOIN review_batches b ON b.id=j.batch_id
-           LEFT JOIN audit_templates t ON t.id=b.template_id ORDER BY j.created_at DESC"""
+           LEFT JOIN audit_templates t ON t.id=b.template_id
+           WHERE b.deleted_at='' ORDER BY j.created_at DESC"""
     )
-    selected_task_batch = _render_all_tasks_dashboard(all_tasks)
+    selected_task_batch = _render_all_tasks_dashboard(active_tasks)
     if selected_task_batch:
-        selected_task = next(row for row in all_tasks if str(row["batch_id"]) == selected_task_batch)
         st.session_state["record_batch"] = selected_task_batch
-        st.session_state["review_scope"] = "回收站" if selected_task.get("deleted_at") else "当前审核"
-    active_rows = [row for row in all_batches if not row.get("deleted_at")]
+    trash_count = int(ctx.db.one(
+        "SELECT COUNT(*) count FROM review_batches WHERE deleted_at<>''"
+    )["count"])
+    with st.container(border=True):
+        trash_bar = st.container(horizontal=True, horizontal_alignment="distribute", vertical_alignment="center")
+        with trash_bar:
+            st.caption(f"回收站 · {trash_count} 条记录（不计入本页任务、批次和问题统计）")
+            if st.button("浏览回收站", icon=":material/recycling:", key="browse_review_trash"):
+                _review_trash_dialog()
     dashboard_filter = str(st.session_state.get("review_dashboard_filter") or "all")
     totals = {
-        "all": len(active_rows),
-        "completed": sum(row["status"] == "completed" for row in active_rows),
-        "processing": sum(row["status"] in {"queued", "running"} for row in active_rows),
-        "issues": sum(int(row["finding_count"] or 0) for row in active_rows),
-        "major": sum(int(row["major_count"] or 0) for row in active_rows),
-        "review": sum(int(row["review_count"] or 0) for row in active_rows),
+        "all": len(active_batches),
+        "completed": sum(row["status"] == "completed" for row in active_batches),
+        "processing": sum(row["status"] in {"queued", "running"} for row in active_batches),
+        "issues": sum(int(row["finding_count"] or 0) for row in active_batches),
+        "major": sum(int(row["major_count"] or 0) for row in active_batches),
+        "review": sum(int(row["review_count"] or 0) for row in active_batches),
     }
     cards = [
         ("all", "全部批次"), ("completed", "已完成"), ("processing", "审核中"),
@@ -184,10 +224,9 @@ def review_records_page() -> None:
                 st.session_state["review_dashboard_filter"] = key
                 st.rerun()
     st.caption("点击上方总数卡片即可筛选下方批次表；再点击表格中的一行查看问题、文件、过程和导出。")
-    view_mode = st.segmented_control("记录范围", ["当前审核", "回收站"], default="当前审核", key="review_scope")
-    batches = active_rows if view_mode == "当前审核" else [row for row in all_batches if row.get("deleted_at")]
+    batches = active_batches
     if not batches:
-        st.info("暂无记录。" if view_mode == "回收站" else "暂无审核记录。请先在“开始审核”上传文件。")
+        st.info("暂无审核记录。请先在“开始审核”上传文件；已删除记录可通过上方小块浏览。")
         return
     st.subheader("审核批次表")
     with st.container(border=True):
@@ -218,7 +257,7 @@ def review_records_page() -> None:
             "严重/主要": int(row["major_count"] or 0), "待复核": int(row["review_count"] or 0), "创建时间": row["created_at"],
         } for row in visible_batches])
         event = st.dataframe(table, hide_index=True, width="stretch", on_select="rerun", selection_mode="single-row",
-                             key=f"review_batch_table_{view_mode}",
+                             key="review_batch_table_active",
                              column_config={"问题": st.column_config.NumberColumn(format="%d"),
                                             "严重/主要": st.column_config.NumberColumn(format="%d"),
                                             "待复核": st.column_config.NumberColumn(format="%d")})
@@ -233,19 +272,8 @@ def review_records_page() -> None:
     batch = next(row for row in batches if row["id"] == batch_id)
     with st.container(horizontal=True, horizontal_alignment="distribute", vertical_alignment="center"):
         st.subheader(f"{batch['name']} · {batch.get('supplier_name') or '供应商未识别'}")
-        if view_mode == "当前审核":
-            if st.button("移到回收站", icon=":material/delete:", key=f"trash_{batch_id}"):
-                _confirm_delete(batch_id, str(batch["name"]), permanent=False)
-        else:
-            with st.container(horizontal=True):
-                if st.button("恢复", icon=":material/restore:", key=f"restore_{batch_id}"):
-                    ctx.db.restore_batch(batch_id); st.toast("审核记录已恢复"); st.rerun()
-                purge_due = _purge_due(str(batch.get("purge_after") or ""))
-                if st.button("永久删除", icon=":material/delete_forever:", key=f"purge_{batch_id}", type="primary",
-                             disabled=not purge_due, help=None if purge_due else "30天保留期结束后才能永久删除"):
-                    _confirm_delete(batch_id, str(batch["name"]), permanent=True)
-    if view_mode == "回收站":
-        st.caption(f"将在 {batch.get('purge_after') or '30天后'} 到期；永久删除前仍可恢复。")
+        if st.button("移到回收站", icon=":material/delete:", key=f"trash_{batch_id}"):
+            _confirm_delete(batch_id, str(batch["name"]), permanent=False)
     if batch["status"] != "completed":
         batch_status_card(batch_id)
     detail_view = st.segmented_control("批次详情", ["问题", "文件", "处理过程", "导出"], default="问题", key=f"batch_view_{batch_id}")
@@ -323,6 +351,73 @@ def _render_all_tasks_dashboard(tasks: list[dict[str, object]]) -> str:
     return ""
 
 
+@st.dialog("审核回收站")
+def _review_trash_dialog() -> None:
+    """Keep deleted batches isolated from the audit-center layout and metrics."""
+    ctx = get_context()
+    rows = ctx.db.query(
+        """SELECT b.id,b.name,b.supplier_name,b.status,b.deleted_at,b.purge_after,b.created_at,
+                  (SELECT COUNT(*) FROM findings f WHERE f.batch_id=b.id) finding_count,
+                  (SELECT COUNT(*) FROM batch_documents bd WHERE bd.batch_id=b.id) file_count
+           FROM review_batches b WHERE b.deleted_at<>'' ORDER BY b.deleted_at DESC"""
+    )
+    if not rows:
+        st.info("回收站为空。")
+        return
+
+    st.caption("这里的记录不会出现在审核中心主表、任务 Dashboard 或任何统计卡片中。")
+    st.dataframe(
+        pd.DataFrame([{
+            "批次": row["name"], "供应商": row.get("supplier_name") or "未识别",
+            "文件": int(row["file_count"] or 0), "问题": int(row["finding_count"] or 0),
+            "移入时间": row["deleted_at"],
+        } for row in rows]),
+        hide_index=True, width="stretch",
+        column_config={"文件": st.column_config.NumberColumn(format="%d"),
+                       "问题": st.column_config.NumberColumn(format="%d")},
+    )
+    options = {
+        f"{row['name']} · {row.get('supplier_name') or '未识别'} · {str(row['id'])[:8]}": row
+        for row in rows
+    }
+    selected_label = st.selectbox("选择要处理的记录", list(options), key="trash_selected_batch")
+    selected = options[selected_label]
+    st.caption(
+        f"移入回收站：{selected['deleted_at']}　·　原保留期截至：{selected.get('purge_after') or '未设置'}"
+    )
+    confirmed = st.checkbox(
+        "我确认立即永久删除所选记录及其专属文件（无法恢复）",
+        key=f"force_purge_confirm_{selected['id']}",
+    )
+    with st.container(horizontal=True):
+        if st.button("恢复到审核中心", icon=":material/restore:", key=f"trash_restore_{selected['id']}"):
+            ctx.db.restore_batch(str(selected["id"]))
+            st.toast("审核记录已恢复", icon=":material/restore:")
+            st.rerun()
+        if st.button(
+            "立即永久删除", icon=":material/delete_forever:", type="primary",
+            disabled=not confirmed, key=f"trash_force_purge_{selected['id']}",
+        ):
+            _force_purge_review(ctx, str(selected["id"]))
+            st.toast("审核记录已永久删除", icon=":material/delete_forever:")
+            st.rerun()
+
+
+def _force_purge_review(ctx: object, batch_id: str) -> None:
+    """Force deletion while remaining compatible with a pre-update cached service."""
+    purge = ctx.service.purge_review  # type: ignore[attr-defined]
+    if "force" in inspect.signature(purge).parameters:
+        purge(batch_id, force=True)
+        return
+    # Streamlit may still hold the previous ReviewService object. Expiring the
+    # retention timestamp lets that implementation perform its normal, safe
+    # filesystem cleanup without requiring a process restart.
+    ctx.db.update_batch(  # type: ignore[attr-defined]
+        batch_id, purge_after=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    )
+    purge(batch_id)
+
+
 @st.dialog("确认删除审核记录")
 def _confirm_delete(batch_id: str, name: str, permanent: bool) -> None:
     ctx = get_context()
@@ -330,7 +425,7 @@ def _confirm_delete(batch_id: str, name: str, permanent: bool) -> None:
         st.warning(f"将永久删除 **{name}** 的问题、反馈、专属文件和本地检索缓存，无法恢复。")
         confirmed = st.checkbox("我确认永久删除以上内容")
         if st.button("永久删除", type="primary", disabled=not confirmed, icon=":material/delete_forever:"):
-            ctx.service.purge_review(batch_id); st.toast("审核记录已永久删除"); st.rerun()
+            _force_purge_review(ctx, batch_id); st.toast("审核记录已永久删除"); st.rerun()
     else:
         st.write(f"“{name}”将进入回收站，30天内可以恢复。运行中的审核会先安全停止。")
         if st.button("移到回收站", type="primary", icon=":material/delete:"):
@@ -684,6 +779,14 @@ def templates_page() -> None:
     names = {row["name"]: row for row in templates}
     selected_name = st.selectbox("选择模板", [*names, "新建模板"])
     selected = names.get(selected_name)
+    if selected:
+        delete_disabled = bool(selected["is_default"])
+        if st.button(
+            "删除当前模板", icon=":material/delete_forever:", key=f"delete_template_{selected['id']}",
+            disabled=delete_disabled,
+            help="默认模板不能直接删除，请先把其他模板设为默认模板。" if delete_disabled else "删除后无法恢复，但既有审核批次仍保留模板快照。",
+        ):
+            _confirm_delete_template(int(selected["id"]), str(selected["name"]))
     basis = ctx.db.query("SELECT id,original_name FROM documents WHERE library_code='basis' AND parse_status='completed' ORDER BY created_at DESC")
     basis_labels = {row["original_name"]: row["id"] for row in basis}
     attached = [] if not selected else [row["document_id"] for row in ctx.db.query("SELECT document_id FROM template_basis WHERE template_id=?", (selected["id"],))]
@@ -768,6 +871,50 @@ def templates_page() -> None:
                                        [(template_id, basis_labels[label]) for label in default_basis])
             st.success("模板已保存。")
             st.rerun()
+
+
+@st.dialog("确认删除规则模板")
+def _confirm_delete_template(template_id: int, name: str) -> None:
+    ctx = get_context()
+    st.warning(f"将永久删除规则模板 **{name}** 及其默认依据绑定。已经创建的审核批次和模板快照不会删除。")
+    confirmed = st.checkbox("我确认删除此模板", key=f"confirm_template_delete_{template_id}")
+    if st.button(
+        "永久删除模板", type="primary", icon=":material/delete_forever:",
+        disabled=not confirmed, key=f"confirm_template_delete_button_{template_id}",
+    ):
+        try:
+            _delete_template(ctx.db, template_id)
+            st.toast("模板已删除", icon=":material/check_circle:")
+            st.rerun()
+        except ValueError as exc:
+            st.error(str(exc))
+
+
+def _delete_template(db: object, template_id: int) -> None:
+    """Delete through the current API or a hot-reload-safe compatibility path.
+
+    Streamlit keeps the database object in ``cache_resource``. After an app
+    update that adds ``ReviewDatabase.delete_template``, the already-cached
+    instance can still belong to the older class and therefore lack the new
+    method until the whole app is restarted.
+    """
+    delete = getattr(db, "delete_template", None)
+    if callable(delete):
+        delete(template_id)
+        return
+
+    # ``one`` and ``execute`` are long-standing ReviewDatabase APIs, so this
+    # also works for an object cached before delete_template was introduced.
+    template = db.one(  # type: ignore[attr-defined]
+        "SELECT name,is_default FROM audit_templates WHERE id=?", (template_id,),
+    )
+    if not template:
+        raise ValueError("模板不存在或已被删除")
+    if template["is_default"]:
+        raise ValueError("默认模板不能直接删除；请先将其他模板设为默认模板")
+    db.execute("DELETE FROM audit_templates WHERE id=?", (template_id,))  # type: ignore[attr-defined]
+
+
 def settings_page() -> None:
     ctx = get_context()
     _section_header("系统设置", "配置 LLM 和 OCR 服务。审核依据使用本地关键词与结构化规则，不需要向量模型。")
@@ -913,18 +1060,6 @@ def _heartbeat_age(value: str | None) -> int:
         return max(0, int((datetime.now(timezone.utc) - timestamp).total_seconds()))
     except ValueError:
         return 0
-
-
-def _purge_due(value: str) -> bool:
-    if not value:
-        return False
-    try:
-        timestamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        if timestamp.tzinfo is None:
-            timestamp = timestamp.replace(tzinfo=timezone.utc)
-        return timestamp <= datetime.now(timezone.utc)
-    except ValueError:
-        return False
 
 
 def _age_label(seconds: int) -> str:

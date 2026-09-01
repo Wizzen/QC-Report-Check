@@ -9,7 +9,7 @@ from pathlib import Path
 from app.models import Finding, PageText
 
 
-FASTENER_TEMPLATE_NAME = "通用紧固件质量文件审核"
+FASTENER_TEMPLATE_NAME = "紧固件质量文件审核"
 FASTENER_REQUIRED_CHECKS = [
     "A1 文件完整性",
     "A2 文件可读性/清晰度",
@@ -28,7 +28,7 @@ FASTENER_REQUIRED_CHECKS = [
 FASTENER_REVIEW_INSTRUCTIONS = """你是维修备件紧固件质量文件审核专家。只依据本次文件和所选审核依据判断，不得引用未提供的标准或臆测。
 紧固件质量文件包应包含 COC，以及每个有后续文件的 WDC 对应的 COI/MTR；COI/MTR应包含尺寸、机械性能和化学成分。
 逐项检查文件可读性、签字/盖章、日期、出具单位、WDC、产品规格/尺寸/等级/标准、检测数据与结论一致性。
-PO 在此场景仅作识别，不用非特定格式订单号直接判废；WDC 从文件名或正文识别，去除分隔符后应为 8 或 10 位数字。
+PO 在此场景仅作识别，不因订单号不符合特定客户格式而直接判废；WDC 从文件名或正文识别，去除分隔符后应为 8 或 10 位数字。
 标准值或实测值缺失、公差写法无法判断、扫描页无法识别时判为存疑。Sample/Pass 数量不相等、实测值超出文件中明确标准但仍宣称合格、印记不一致时判为不合格。
 每个不合格或存疑项必须给出原文件名、页码和可核验的原文/表格证据；没有证据不得下结论。"""
 

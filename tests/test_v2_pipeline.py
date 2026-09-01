@@ -3,7 +3,8 @@ from __future__ import annotations
 from io import BytesIO
 import json
 from pathlib import Path
-from threading import Barrier
+from threading import Barrier, Lock
+import time
 from unittest.mock import patch
 
 import pymupdf
@@ -59,7 +60,9 @@ def test_each_upload_creates_an_independent_event_and_document_copy(tmp_path: Pa
     service = _service(tmp_path)
     template_id = service.db.one("SELECT id FROM audit_templates WHERE is_default=1")["id"]
 
-    first_batch = service.create_review(template_id, [], [_pdf("Report No R-1", "same-name.pdf")], [])
+    first_batch = service.create_review(
+        template_id, [], [_pdf("Report No R-1", "same-name.pdf")], [], llm_concurrency=2
+    )
     second_batch = service.create_review(template_id, [], [_pdf("Report No R-2", "same-name.pdf")], [])
 
     assert first_batch != second_batch
@@ -78,6 +81,7 @@ def test_each_upload_creates_an_independent_event_and_document_copy(tmp_path: Pa
     assert service.db.one("SELECT template_snapshot FROM review_batches WHERE id=?", (first_batch,))["template_snapshot"]
     assert service.db.one("SELECT template_snapshot FROM review_batches WHERE id=?", (second_batch,))["template_snapshot"]
     assert service.db.one("SELECT review_mode FROM review_batches WHERE id=?", (first_batch,))["review_mode"] == "adaptive"
+    assert service.db.one("SELECT llm_concurrency FROM review_batches WHERE id=?", (first_batch,))["llm_concurrency"] == 2
 
 
 def test_full_local_rule_path_uses_basis_not_supplier_archive(tmp_path: Path) -> None:
@@ -136,7 +140,7 @@ def test_fastener_template_alias_keeps_proven_report_checks(tmp_path: Path) -> N
     template_id = service.db.execute(
         """INSERT INTO audit_templates(name,description,required_document_types,required_items,review_instructions,
            enabled,is_default,created_at) VALUES(?,?,?,?,?,1,0,datetime('now'))""",
-        ("紧固件质量文件审核", "", "[]", "[]", "核验 WDC、COC/MTR 以及 Sample/Pass 表格"),
+        ("维修备件紧固件审核", "", "[]", "[]", "核验 WDC、COC/MTR 以及 Sample/Pass 表格"),
     )
     batch_id = service.db.create_batch(template_id)
     document_id = service.db.add_document(
@@ -231,14 +235,14 @@ def test_each_template_item_calls_llm_once_and_is_aggregated(tmp_path: Path) -> 
 
 def test_template_rule_tasks_are_submitted_concurrently(tmp_path: Path) -> None:
     service = _service(tmp_path)
-    service.config_store.save({"llm_model": "test-model", "llm_concurrency": 3})
+    service.config_store.save({"llm_model": "test-model", "llm_concurrency": 1})
     tasks = ["任务一", "任务二", "任务三"]
     template_id = service.db.execute(
         """INSERT INTO audit_templates(name,description,required_document_types,required_items,review_instructions,
            enabled,is_default,created_at) VALUES(?,?,?,?,?,1,0,datetime('now'))""",
         ("并发模板", "", "[]", json.dumps(tasks, ensure_ascii=False), "只依据原文"),
     )
-    batch_id = service.db.create_batch(template_id)
+    batch_id = service.db.create_batch(template_id, llm_concurrency=3)
     document_id = service.db.add_document(
         library="supplier", kind="supplier", original_name="MTR.pdf",
         stored_path=str(tmp_path / "MTR.pdf"), sha256="parallel-rules",
@@ -248,16 +252,25 @@ def test_template_rule_tasks_are_submitted_concurrently(tmp_path: Path) -> None:
         (json.dumps([{"page": 1, "text": "Inspection Report"}], ensure_ascii=False), document_id),
     )
     service.db.attach_document(batch_id, document_id, "supplier", 4)
-    rendezvous = Barrier(3)
+    state_lock = Lock()
+    active = 0
+    max_active = 0
 
     def concurrent_response(*_args, **_kwargs):
-        rendezvous.wait(timeout=2)
+        nonlocal active, max_active
+        with state_lock:
+            active += 1
+            max_active = max(max_active, active)
+        time.sleep(0.03)
+        with state_lock:
+            active -= 1
         return {"result": "不适用", "conclusion": "测试完成", "confidence": 0.9}
 
     with patch("app.auditing.v2_service.LLMClient.generate_json", side_effect=concurrent_response) as generate:
         service._expert_review(batch_id, [])
 
     assert generate.call_count == 3
+    assert max_active == 2
     assert all(call.kwargs["timeout_seconds"] == 90 for call in generate.call_args_list)
     assert all(call.kwargs["max_tokens"] == 220 for call in generate.call_args_list)
     assert all(call.kwargs["retries"] == 1 for call in generate.call_args_list)

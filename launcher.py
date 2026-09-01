@@ -47,8 +47,9 @@ def main() -> int:
     # Initialize and migrate SQLite once before the web process and worker start.
     # This avoids a clean installation racing two schema initializers.
     ReviewDatabase(load_config().storage.database_v2)
+    server_host = os.environ.get("QAQC_HOST", "127.0.0.1").strip() or "127.0.0.1"
     streamlit_command = [sys.executable, "-m", "streamlit", "run", str(ROOT / "streamlit_app.py"),
-               "--browser.gatherUsageStats=false", "--server.address=127.0.0.1"]
+               "--browser.gatherUsageStats=false", f"--server.address={server_host}"]
     worker_command = [sys.executable, str(ROOT / "worker.py")]
     worker, worker_log = _spawn(worker_command, "worker.log")
     web, web_log = _spawn(streamlit_command, "web.log")
