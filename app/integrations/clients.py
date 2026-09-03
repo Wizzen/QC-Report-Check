@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import base64
 import logging
 import mimetypes
 import re
@@ -8,7 +9,7 @@ import time
 import uuid
 from threading import Lock
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlsplit, urlunsplit
 
 import requests
@@ -18,6 +19,19 @@ from app.llm.ollama_client import parse_json_object
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+class LLMJSONFormatError(ValueError):
+    """The model replied, but did not finish a valid JSON object."""
+
+
+def _parse_generated_json(content: str, finish_reason: str = '') -> dict[str, Any]:
+    if finish_reason in {'length', 'max_tokens'}:
+        raise LLMJSONFormatError('模型达到输出 token 上限，结果可能不完整')
+    try:
+        return parse_json_object(content)
+    except (ValueError, TypeError) as exc:
+        raise LLMJSONFormatError(f'模型 JSON 格式不完整或无效：{exc}') from exc
 
 
 def _headers(api_key: str) -> dict[str, str]:
@@ -157,7 +171,7 @@ class LLMClient:
             if reasoning:
                 raise ValueError("LLM 只返回推理内容，未返回最终 JSON")
             raise ValueError("LLM 返回空内容")
-        return parse_json_object(content)
+        return _parse_generated_json(content)
 
     def available_models(self) -> list[str]:
         response = requests.get(
@@ -256,19 +270,30 @@ class LLMClient:
         return {"ok": False, "detail": f"模型 {model} 返回空响应"}
 
     def generate_json(self, prompt: str, retries: int = 2, timeout_seconds: int = 180,
-                      max_tokens: int | None = None, thinking: bool | str | None = None) -> dict[str, Any]:
+                      max_tokens: int | None = None, thinking: bool | str | None = None,
+                      images: list[bytes] | None = None, recover_json: bool = False,
+                      check_cancel: Callable[[], None] | None = None) -> dict[str, Any]:
+        if images:
+            ensure_url_allowed(self.settings.llm_base_url, False)
         last_error: Exception | None = None
         last_detail = ""
         attempt = 0
         max_attempts = retries + 1
         serial_recovery_added = False
+        json_recovery_added = False
+        output_tokens = max_tokens
+        request_thinking = thinking
         while attempt < max_attempts:
+            if check_cancel:
+                check_cancel()
             try:
                 model = self.resolve_model()
                 request_prompt = prompt + ("\n只输出一个 JSON 对象。" if attempt else "")
-                if thinking is not None and self._uses_lm_studio_native_api():
+                if json_recovery_added:
+                    request_prompt += '\n上次JSON不完整。不要续写片段；按原字段格式重新输出一个完整对象，不要分析或Markdown。缩短说明和摘录，必须保留状态、文件、页码与可核验依据；不确定就标为存疑。'
+                if request_thinking is not None and not images and self._uses_lm_studio_native_api():
                     return self._generate_lm_studio_json(
-                        request_prompt, model, thinking, timeout_seconds, max_tokens,
+                        request_prompt, model, request_thinking, timeout_seconds, output_tokens,
                     )
                 payload: dict[str, Any] = {
                     "temperature": self.settings.llm_temperature,
@@ -276,15 +301,21 @@ class LLMClient:
                     "messages": [{"role": "user", "content": request_prompt}],
                 }
                 payload["model"] = model
+                if images:
+                    payload["messages"][0]["content"] = [
+                        {"type": "text", "text": request_prompt},
+                        *[{"type": "image_url", "image_url": {"url": "data:image/png;base64," + base64.b64encode(data).decode("ascii")}}
+                          for data in images],
+                    ]
                 # Qwen3/3.5 exposes a hard thinking switch through its chat
                 # template. Avoid sending this provider-specific field to other
                 # OpenAI-compatible models that may reject unknown parameters.
-                if thinking is not None and re.search(r"qwen[\s._/-]*3", str(payload["model"]), re.IGNORECASE):
+                if request_thinking is not None and re.search(r"qwen[\s._/-]*3", str(payload["model"]), re.IGNORECASE):
                     payload["chat_template_kwargs"] = {
-                        "enable_thinking": thinking not in {False, "off"},
+                        "enable_thinking": request_thinking not in {False, "off"},
                     }
-                if max_tokens is not None:
-                    payload["max_tokens"] = max_tokens
+                if output_tokens is not None:
+                    payload["max_tokens"] = output_tokens
                 request_options = {
                     "headers": _headers(self.settings.llm_api_key),
                     "json": payload,
@@ -307,15 +338,28 @@ class LLMClient:
                     raise ValueError(f"LLM 响应缺少 choices 字段（实际字段：{fields or '无'}）")
                 message = choices[0].get("message", {})
                 content = message.get("content")
+                finish_reason = str(choices[0].get('finish_reason') or '')
+                if finish_reason in {'length', 'max_tokens'}:
+                    LOGGER.warning('LLM 输出截断：finish_reason=%s completion_tokens=%s output_chars=%s budget=%s',
+                        finish_reason, (body.get('usage') or {}).get('completion_tokens'), len(str(content or '')), output_tokens)
+                    raise LLMJSONFormatError('模型达到输出 token 上限，结果可能不完整')
                 if content is None or not str(content).strip():
                     reasoning = message.get("reasoning_content") or message.get("reasoning")
                     if reasoning and str(reasoning).strip():
                         raise ValueError("LLM 只返回推理内容，未返回最终 JSON")
                     raise ValueError("LLM 返回空内容")
-                return parse_json_object(str(content))
+                return _parse_generated_json(str(content), finish_reason)
             except (requests.RequestException, KeyError, ValueError, json.JSONDecodeError) as exc:
                 last_error = exc
                 detail = str(exc).strip() or type(exc).__name__
+                if isinstance(exc, LLMJSONFormatError) and recover_json and not json_recovery_added:
+                    # One bounded restart from the original evidence; no invented
+                    # string endings, partial JSON or model-weight changes.
+                    max_attempts = max(max_attempts, attempt + 2)
+                    json_recovery_added = True
+                    output_tokens = min(max((max_tokens or 512) * 2, 768), max(max_tokens or 512, 1536))
+                    request_thinking = False
+                    LOGGER.warning('将重试一次完整 JSON，输出预算=%s，关闭思考', output_tokens)
                 if isinstance(exc, requests.HTTPError) and exc.response is not None:
                     body = exc.response.text.strip().replace("\n", " ")[:240]
                     detail = f"HTTP {exc.response.status_code}: {body or exc.response.reason}"

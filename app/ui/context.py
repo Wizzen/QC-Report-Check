@@ -19,7 +19,7 @@ class UIContext:
 
 
 @st.cache_resource
-def get_context() -> UIContext:
+def get_context(generation: str = 'bolt-optimization-v2') -> UIContext:
     config = load_config()
     db = ReviewDatabase(config.storage.database_v2)
     store = ConfigStore(db, ROOT / "data" / "secrets" / "service.key")

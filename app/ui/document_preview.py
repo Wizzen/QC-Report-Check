@@ -9,6 +9,17 @@ import streamlit as st
 from app.evidence import render_pdf_evidence_bytes
 
 
+@st.cache_data(max_entries=24, show_spinner=False)
+def render_pdf_region(path_text: str, modified_ns: int, page_number: int, bbox: tuple) -> bytes:
+    del modified_ns
+    with pymupdf.open(path_text) as document:
+        page = document[max(0, min(page_number-1, len(document)-1))]
+        region = pymupdf.Rect(bbox) & page.rect
+        if region.is_empty:
+            region = page.rect
+        return page.get_pixmap(matrix=pymupdf.Matrix(1.5, 1.5), clip=region).tobytes('png')
+
+
 def document_pages(page_text: str, raw_text: str) -> list[dict[str, object]]:
     try:
         pages = json.loads(page_text or "[]")

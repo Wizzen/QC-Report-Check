@@ -13,6 +13,9 @@ from typing import Any, Iterator, Sequence
 
 SCHEMA_V2 = """
 PRAGMA foreign_keys = ON;
+CREATE TABLE IF NOT EXISTS application_state (
+  key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS document_libraries (
   code TEXT PRIMARY KEY CHECK(code IN ('basis','supplier')),
   name TEXT NOT NULL, description TEXT NOT NULL DEFAULT ''
@@ -174,6 +177,21 @@ CREATE INDEX IF NOT EXISTS idx_learning_policy ON learning_feedback(
   template_key,rule_code,document_type,model_fingerprint,active
 );
 CREATE INDEX IF NOT EXISTS idx_learning_batch ON learning_feedback(batch_fingerprint);
+CREATE INDEX IF NOT EXISTS idx_learning_finding ON learning_feedback(finding_fingerprint,active,id);
+CREATE VIEW IF NOT EXISTS effective_learning_feedback AS
+ SELECT f.* FROM learning_feedback f WHERE f.active=1 AND
+ (f.finding_fingerprint='' OR NOT EXISTS (
+   SELECT 1 FROM learning_feedback newer WHERE newer.active=1
+   AND newer.finding_fingerprint=f.finding_fingerprint AND newer.id>f.id
+ ));
+CREATE TABLE IF NOT EXISTS visual_evidence (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, batch_id TEXT NOT NULL, document_id TEXT NOT NULL,
+  page INTEGER NOT NULL, bbox TEXT NOT NULL DEFAULT '[]', kind TEXT NOT NULL, state TEXT NOT NULL,
+  method TEXT NOT NULL, confidence REAL NOT NULL DEFAULT 0, details TEXT NOT NULL DEFAULT '{}',
+  model_fingerprint TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
+  FOREIGN KEY(batch_id) REFERENCES review_batches(id) ON DELETE CASCADE,
+  FOREIGN KEY(document_id) REFERENCES documents(id) ON DELETE CASCADE
+);
 CREATE TABLE IF NOT EXISTS feedback_pattern_state (
   pattern_key TEXT PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 1, updated_at TEXT NOT NULL
 );
@@ -205,6 +223,11 @@ class ReviewDatabase:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._backup_before_v04()
         self._backup_before_v06()
+        if self.path.exists():
+            backup_path = self.path.with_suffix(self.path.suffix + '.pre-bolt-v1.bak')
+            if not backup_path.exists():
+                with sqlite3.connect(self.path) as source, sqlite3.connect(backup_path) as destination:
+                    source.backup(destination)
         self.initialize()
 
     def _backup_before_v04(self) -> None:
@@ -254,6 +277,7 @@ class ReviewDatabase:
             """)
             columns = {row[1] for row in connection.execute("PRAGMA table_info(review_batches)").fetchall()}
             for name, declaration in {
+                "audit_scope": "TEXT NOT NULL DEFAULT 'full_package'",
                 "supplier_name": "TEXT NOT NULL DEFAULT ''",
                 "review_mode": "TEXT NOT NULL DEFAULT 'adaptive'",
                 "llm_concurrency": "INTEGER NOT NULL DEFAULT 0",
@@ -273,6 +297,8 @@ class ReviewDatabase:
                     connection.execute(f"ALTER TABLE review_batches ADD COLUMN {name} {declaration}")
             document_columns = {row[1] for row in connection.execute("PRAGMA table_info(documents)").fetchall()}
             for name, declaration in {
+                "extraction_fingerprint": "TEXT NOT NULL DEFAULT ''",
+                "source_document_id": "TEXT NOT NULL DEFAULT ''",
                 "supplier_name": "TEXT NOT NULL DEFAULT ''",
                 "detected_type": "TEXT NOT NULL DEFAULT ''",
                 "type_confidence": "REAL NOT NULL DEFAULT 0",
@@ -290,6 +316,10 @@ class ReviewDatabase:
             template_columns = {row[1] for row in connection.execute("PRAGMA table_info(audit_templates)").fetchall()}
             if "review_instructions" not in template_columns:
                 connection.execute("ALTER TABLE audit_templates ADD COLUMN review_instructions TEXT NOT NULL DEFAULT ''")
+            if "engine_binding" not in template_columns:
+                connection.execute("ALTER TABLE audit_templates ADD COLUMN engine_binding TEXT NOT NULL DEFAULT 'legacy'")
+            if "template_version" not in template_columns:
+                connection.execute("ALTER TABLE audit_templates ADD COLUMN template_version INTEGER NOT NULL DEFAULT 1")
             service_columns = {row[1] for row in connection.execute("PRAGMA table_info(service_config)").fetchall()}
             for name, declaration in {
                 "llm_concurrency": "INTEGER NOT NULL DEFAULT 1",
@@ -345,22 +375,24 @@ class ReviewDatabase:
         return rows[0] if rows else None
 
     def create_batch(self, template_id: int | None, review_mode: str = "adaptive",
-                     llm_concurrency: int = 0) -> str:
+                     llm_concurrency: int = 0, audit_scope: str = "full_package") -> str:
+        if audit_scope not in {"full_package", "single_document"}:
+            raise ValueError("审核范围必须是完整文件包或单文件预检查")
         batch_id = str(uuid.uuid4())
         now = utcnow()
         # Seconds make repeated uploads visibly distinct while the UUID remains the
         # stable event identity used by storage, jobs and findings.
         name = f"审核批次 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         template = self.one(
-            "SELECT name,description,required_items,review_instructions FROM audit_templates WHERE id=?", (template_id,)
+            "SELECT name,description,required_items,review_instructions,engine_binding,template_version,required_document_types FROM audit_templates WHERE id=?", (template_id,)
         ) if template_id else None
-        snapshot = json.dumps(template or {}, ensure_ascii=False)
+        snapshot = json.dumps({**(template or {}), "audit_scope": audit_scope}, ensure_ascii=False)
         review_mode = review_mode if review_mode in {"adaptive", "deep"} else "adaptive"
         llm_concurrency = max(0, min(4, int(llm_concurrency or 0)))
         self.execute(
             """INSERT INTO review_batches(id,name,template_id,review_mode,llm_concurrency,template_snapshot,
-               heartbeat_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)""",
-            (batch_id, name, template_id, review_mode, llm_concurrency, snapshot, now, now, now),
+               audit_scope,heartbeat_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+            (batch_id, name, template_id, review_mode, llm_concurrency, snapshot, audit_scope, now, now, now),
         )
         self.execute(
             "INSERT INTO jobs(id,batch_id,created_at,updated_at) VALUES(?,?,?,?)",
@@ -435,6 +467,21 @@ class ReviewDatabase:
         except (TypeError, ValueError):
             template_snapshot = {}
         template_key = str(template_snapshot.get("name") or row.get("template_id") or "")
+        # New-engine feedback must use the inference-time identity, not the
+        # current settings (which may have changed since this finding was made).
+        if template_snapshot.get('engine_binding') == 'bolt-v1':
+            try:
+                metadata = json.loads(row.get('metadata') or '{}')
+            except (TypeError, ValueError):
+                metadata = {}
+            identity = metadata.get('feedback_identity', {})
+            if isinstance(identity, dict) and identity.get('template_key') and identity.get('model_fingerprint'):
+                template_key = str(identity['template_key'])
+                service_fingerprint = str(identity['model_fingerprint'])
+            else:
+                # Historical rows without a trustworthy fingerprint remain audit
+                # history. Never guess their model/OCR/rule version for learning.
+                learning_eligible = False
         task_key = str(row.get("item") or "")
         document_type = str(row.get("document_type") or "") or self._document_type_for_finding(row)
         now = utcnow()
@@ -526,7 +573,7 @@ class ReviewDatabase:
     def feedback_policy_for(self, *, template_key: str, rule_code: str, document_type: str,
                             model_fingerprint: str = "") -> dict[str, Any]:
         rows = self.query(
-            """SELECT action,COUNT(*) count FROM learning_feedback WHERE active=1
+            """SELECT action,COUNT(*) count FROM effective_learning_feedback WHERE active=1
                AND template_key=? AND rule_code=? AND document_type=? AND model_fingerprint=?
                GROUP BY action""", (template_key, rule_code, document_type, model_fingerprint),
         )
@@ -549,7 +596,7 @@ class ReviewDatabase:
     def learning_summary(self) -> dict[str, Any]:
         rows = self.query(
             """SELECT template_key,rule_code,document_type,model_fingerprint,action,COUNT(*) count
-               FROM learning_feedback WHERE active=1
+               FROM effective_learning_feedback WHERE active=1
                GROUP BY template_key,rule_code,document_type,model_fingerprint,action"""
         )
         grouped: dict[tuple[str, str, str, str], dict[str, Any]] = {}
@@ -567,7 +614,7 @@ class ReviewDatabase:
         rejected = sum(item["actions"].get("误报驳回", 0) for item in patterns)
         confirmed = sum(item["actions"].get("确认问题", 0) for item in patterns)
         missed = sum(item["actions"].get("补充漏检问题", 0) for item in patterns)
-        reports = self.one("SELECT COUNT(DISTINCT batch_fingerprint) count FROM learning_feedback WHERE active=1")
+        reports = self.one("SELECT COUNT(DISTINCT batch_fingerprint) count FROM effective_learning_feedback WHERE batch_fingerprint<>''")
         return {"total": total, "confirmed": confirmed, "rejected": rejected, "missed": missed,
                 "confirmation_rate": confirmed / total if total else 0.0,
                 "rejection_rate": rejected / total if total else 0.0,
@@ -595,7 +642,7 @@ class ReviewDatabase:
     def export_learning_feedback(self) -> str:
         rows = self.query(
             """SELECT template_key,task_key,rule_code,document_type,action,reason_code,corrected_status,
-               corrected_severity,evidence_fingerprint,model_fingerprint,created_at FROM learning_feedback
+               corrected_severity,evidence_fingerprint,model_fingerprint,created_at FROM effective_learning_feedback
                WHERE active=1 ORDER BY id"""
         )
         return "\n".join(json.dumps(row, ensure_ascii=False, sort_keys=True) for row in rows)
@@ -664,6 +711,12 @@ class ReviewDatabase:
         with self.connect() as connection:
             batch_fingerprint = _fingerprint(batch_id)
             if retain_learning:
+                # Freeze deduplication before removing source identities. Otherwise
+                # repeated clicks would turn into independent anonymous samples.
+                connection.execute(
+                    """UPDATE learning_feedback SET active=0 WHERE batch_fingerprint=? AND active=1
+                       AND id NOT IN (SELECT id FROM effective_learning_feedback)""", (batch_fingerprint,),
+                )
                 connection.execute(
                     "UPDATE learning_feedback SET batch_fingerprint='',finding_fingerprint='' WHERE batch_fingerprint=?",
                     (batch_fingerprint,),

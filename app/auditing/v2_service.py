@@ -26,15 +26,18 @@ from app.auditing.expert_review import (
     enabled_template_tasks,
     parse_template_tasks,
     rule_evaluation_from_llm,
+    _document_type,
 )
 from app.database import ReviewDatabase
 from app.database.v2 import utcnow
 from app.extractors import extract_filename_items, extract_items, extract_requirements
 from app.integrations import ConfigStore, LLMClient, MinerUClient
+from app.integrations.settings import ensure_url_allowed
 from app.models import ExtractedItem, Finding, PageText, Requirement
 from app.parsers import parse_document
 from app.rules import AuditEngine
 from app.utils import save_upload
+from app.auditing.bolt_template import BOLT_ENGINE, BOLT_TEMPLATE_NAME, BOLT_INSTRUCTIONS, EXTRACTION_VERSION, bolt_rules
 
 
 LOGGER = logging.getLogger(__name__)
@@ -55,6 +58,7 @@ class ReviewService:
         self.confidence_threshold = max(0.0, min(1.0, float(confidence_threshold)))
         self._deterministic_passes: dict[str, set[str]] = {}
         self._ensure_fastener_template()
+        self.ensure_bolt_template()
         self._backfill_supplier_names()
         self._backfill_search_evidence()
 
@@ -70,15 +74,7 @@ class ReviewService:
             if row:
                 self.db.execute("UPDATE audit_templates SET name=? WHERE id=?", (FASTENER_TEMPLATE_NAME, row["id"]))
         if row:
-            # An explicitly saved all-disabled table is still a valid user configuration.
-            # Only seed the built-in rows when the template truly has no rows at all.
-            required_items = row["required_items"] if parse_template_tasks(row["required_items"]) else json.dumps(FASTENER_REQUIRED_CHECKS, ensure_ascii=False)
-            instructions = FASTENER_REVIEW_INSTRUCTIONS
-            self.db.execute(
-                "UPDATE audit_templates SET description=?,review_instructions=?,required_document_types=?,required_items=? WHERE id=?",
-                ("按文件/WDC关系、表格实测数据和逐页证据审核紧固件质量文件。", instructions,
-                 json.dumps(["COC", "COI/MTR"], ensure_ascii=False), required_items, row["id"]),
-            )
+            # Existing instructions (including empty or all-disabled rules) belong to the user.
             return
         self.db.execute(
             """INSERT INTO audit_templates(name,description,required_document_types,required_items,review_instructions,
@@ -87,6 +83,34 @@ class ReviewService:
              json.dumps(["COC", "COI/MTR"], ensure_ascii=False),
              json.dumps(FASTENER_REQUIRED_CHECKS, ensure_ascii=False), FASTENER_REVIEW_INSTRUCTIONS, utcnow()),
         )
+
+    def ensure_bolt_template(self) -> int | None:
+        """Seed once, preserving subsequent renames, edits and intentional deletion."""
+        with self.db.connect() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            seeded = connection.execute("SELECT value FROM application_state WHERE key='bolt-template-seeded'").fetchone()
+            if seeded:
+                row = connection.execute('SELECT id FROM audit_templates WHERE id=?', (seeded['value'],)).fetchone()
+                return int(row['id']) if row else None
+            row = connection.execute(
+                'SELECT id FROM audit_templates WHERE engine_binding=? OR name=? ORDER BY id LIMIT 1',
+                (BOLT_ENGINE, BOLT_TEMPLATE_NAME),
+            ).fetchone()
+            if row:
+                template_id = int(row['id'])
+            else:
+                cursor = connection.execute(
+                    """INSERT INTO audit_templates(name,description,required_document_types,required_items,
+                       review_instructions,engine_binding,template_version,enabled,is_default,created_at)
+                       VALUES(?,?,?,?,?,?,1,1,0,?)""",
+                    (BOLT_TEMPLATE_NAME, "按文件/WDC审核；电子签名可接受；印章仅按明确依据。",
+                     '["COC","COI/MTR"]', json.dumps(bolt_rules(), ensure_ascii=False), BOLT_INSTRUCTIONS,
+                     BOLT_ENGINE, utcnow()),
+                )
+                template_id = int(cursor.lastrowid)
+            connection.execute("INSERT INTO application_state(key,value,updated_at) VALUES('bolt-template-seeded',?,?)",
+                               (str(template_id), utcnow()))
+            return template_id
 
     def _backfill_supplier_names(self) -> None:
         rows = self.db.query(
@@ -125,12 +149,13 @@ class ReviewService:
 
     def create_review(self, template_id: int | None, selected_basis: list[str],
                       supplier_files: Iterable[object], supplemental_files: Iterable[object],
-                      review_mode: str = "adaptive", llm_concurrency: int = 0) -> str:
+                      review_mode: str = "adaptive", llm_concurrency: int = 0,
+                      audit_scope: str = "full_package") -> str:
         supplier_files = list(supplier_files)
         supplemental_files = list(supplemental_files)
         if not supplier_files:
             raise ValueError("至少需要上传一份供应商质量文件")
-        batch_id = self.db.create_batch(template_id, review_mode, llm_concurrency)
+        batch_id = self.db.create_batch(template_id, review_mode, llm_concurrency, audit_scope)
         destination = self.uploads / batch_id
         for uploaded in supplier_files:
             document_id = self._save_uploaded(uploaded, "supplier", "supplier", destination)
@@ -147,18 +172,33 @@ class ReviewService:
 
     def retry_review(self, source_batch_id: str) -> str:
         source = self.db.one(
-            "SELECT template_id,review_mode,llm_concurrency FROM review_batches WHERE id=?", (source_batch_id,)
+            "SELECT template_id,review_mode,llm_concurrency,audit_scope FROM review_batches WHERE id=?", (source_batch_id,)
         )
         if not source:
             raise ValueError("原审核批次不存在")
         batch_id = self.db.create_batch(
             source["template_id"], str(source.get("review_mode") or "adaptive"),
             int(source.get("llm_concurrency") or 0),
+            str(source.get("audit_scope") or "full_package"),
         )
         rows = self.db.query("SELECT document_id,role,priority FROM batch_documents WHERE batch_id=?", (source_batch_id,))
         for row in rows:
-            self.db.attach_document(batch_id, row["document_id"], row["role"], row["priority"])
+            document_id = self._clone_document(row["document_id"], batch_id)
+            self.db.attach_document(batch_id, document_id, row["role"], row["priority"])
         return batch_id
+
+    def _clone_document(self, document_id: str, batch_id: str) -> str:
+        """Own a physical copy and a fresh parse record; never mutate historical evidence."""
+        row = self.db.one("SELECT * FROM documents WHERE id=?", (document_id,))
+        path = Path(row["stored_path"])
+        destination = self.uploads / batch_id / document_id
+        destination.mkdir(parents=True, exist_ok=True)
+        target = destination / path.name
+        shutil.copy2(path, target)
+        new_id = self.db.add_document(library=row["library_code"], kind=row["document_kind"],
+            original_name=row["original_name"], stored_path=str(target), sha256=row["sha256"], mime_type=row["mime_type"])
+        self.db.execute("UPDATE documents SET source_document_id=? WHERE id=?", (document_id, new_id))
+        return new_id
 
     def purge_review(self, batch_id: str, force: bool = False, retain_learning: bool = True) -> None:
         private = self.db.purge_batch(batch_id, force=force, retain_learning=retain_learning)
@@ -190,8 +230,19 @@ class ReviewService:
         return [row["document_id"] for row in self.db.query("SELECT document_id FROM template_basis WHERE template_id=?", (template_id,))]
 
     def process_batch(self, batch_id: str) -> None:
+        existing = self.db.one("SELECT status,template_snapshot FROM review_batches WHERE id=?", (batch_id,))
+        if not existing or existing['status'] == 'completed':
+            return  # Re-review creates a new batch; historical evidence is immutable.
+        snapshot = json.loads(existing.get('template_snapshot') or '{}')
+        bolt_mode = snapshot.get('engine_binding') == BOLT_ENGINE
+        extra_summary = {}
         try:
             self._check_cancel(batch_id)
+            if bolt_mode:
+                local_settings = self.config_store.get()
+                for endpoint in (local_settings.llm_base_url, local_settings.ocr_base_url):
+                    if endpoint:
+                        ensure_url_allowed(endpoint, False)
             self._activity(batch_id, status="running", stage="解析文件", progress=5, error="", started_at=utcnow(),
                            activity="正在读取批次文件清单", resource="SQLite 本地数据库")
             rows = self.db.query(
@@ -204,19 +255,32 @@ class ReviewService:
                                progress=5 + int(40 * index / max(1, len(rows))),
                                activity=f"准备处理第 {index + 1}/{len(rows)} 份文件",
                                resource="本机文件系统")
+                if bolt_mode and row.get('extraction_fingerprint') != EXTRACTION_VERSION:
+                    if self.db.one("SELECT 1 FROM batch_documents WHERE document_id=? AND batch_id<>?", (row['id'], batch_id)):
+                        replacement = self._clone_document(row['id'], batch_id)
+                        with self.db.connect() as connection:
+                            connection.execute('UPDATE batch_documents SET document_id=? WHERE batch_id=? AND document_id=?',
+                                               (replacement, batch_id, row['id']))
+                        row = {**row, 'id': replacement, 'parse_status': 'pending'}
+                    else:
+                        row['parse_status'] = 'pending'
                 if row["parse_status"] != "completed":
                     self.process_document(row["id"], requirement_priority=int(row["priority"]) if row["role"] != "supplier" else None,
                                           batch_id=batch_id)
                 self._check_cancel(batch_id)
             self._activity(batch_id, stage="执行确定性规则", progress=60, current_file="",
                            activity="正在比较实测值、单位、材料及必检项目", resource="本机 CPU · 确定性规则引擎")
-            findings = self._audit(batch_id)
+            findings = [] if bolt_mode else self._audit(batch_id)
             self._check_cancel(batch_id)
             settings = self.config_store.get()
             self._activity(batch_id, stage="LLM 专家复核", progress=82,
                            activity=f"准备让 LLM 基于逐页证据复核 {len(findings)} 个规则结果并发现遗漏",
                            resource=_resource("LLM", settings.llm_base_url, settings.llm_model))
-            findings = self._expert_review(batch_id, findings)
+            if bolt_mode:
+                from app.auditing.bolt_audit import run_bolt_audit
+                findings, extra_summary = run_bolt_audit(self, batch_id)
+            else:
+                findings = self._expert_review(batch_id, findings)
             self._check_cancel(batch_id)
             self._activity(batch_id, stage="保存审核结果", progress=97,
                            activity="正在写入问题证据、判断逻辑和审核汇总", resource="SQLite 本地数据库")
@@ -249,6 +313,7 @@ class ReviewService:
             summary["total"] = len(findings)
             summary["formal_total"] = sum(item.severity != "Review" for item in findings)
             summary["review_total"] = sum(item.severity == "Review" for item in findings)
+            summary.update(extra_summary)
             self._activity(batch_id, status="completed", stage="审核完成", progress=100, summary=summary, completed_at=utcnow(),
                            activity="所有阶段已完成，结果可以查看", resource="本机")
             self.db.execute("UPDATE jobs SET status='completed',updated_at=? WHERE batch_id=?", (utcnow(), batch_id))
@@ -348,6 +413,9 @@ class ReviewService:
              raw_text, raw_text, supplier_name, ocr_status, "not_used", "", "", document_id),
         )
         self._refresh_supplier_names_for_document(document_id)
+        self.db.execute('UPDATE documents SET extraction_fingerprint=?,detected_type=? WHERE id=?',
+                        (EXTRACTION_VERSION, _document_type(
+                            ExpertDocument(row['original_name'], path, pages, ocr_status)), document_id))
         self._activity(batch_id, activity=f"{row['original_name']} 已完成解析和结构化提取",
                        resource="本机 CPU · 无向量模型")
 
@@ -511,18 +579,21 @@ class ReviewService:
                 verify_prompt = (
                     "只复核下面不合格结论是否被所给原文直接支持。只返回 JSON："
                     '{"confirmed":true|false}。不得补充外部知识。\n'
-                    f"任务：{task}\n原文：{finding.source_text}\n结论：{finding.description}"
+                    f"任务：{task}\n原文：{finding.source_text}\n结论：{finding.description}\n同页上下文："
+                    + '\n'.join(p.text for d in documents if d.filename == finding.source_file
+                                for p in d.pages if p.page == finding.source_page)[:10000]
                 )
                 try:
                     verification = client.generate_json(
                         verify_prompt, retries=0, timeout_seconds=min(45, settings.llm_timeout_seconds),
                         max_tokens=80, thinking=False,
                     )
-                    verified = bool(verification.get("confirmed"))
+                    verified = verification.get("confirmed") is True
                 except Exception:
                     verified = False
                 if not verified:
                     finding.severity = "Review"
+                    finding.metadata['result'] = '存疑'
                     finding.metadata.setdefault("downgrade_reasons", []).append("second_review_not_confirmed")
                     evaluation["status"] = "存疑"
                     evaluation.setdefault("downgrade_reasons", []).append("second_review_not_confirmed")

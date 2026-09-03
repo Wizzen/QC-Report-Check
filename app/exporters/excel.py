@@ -9,6 +9,7 @@ from openpyxl.utils import get_column_letter
 
 from app.database import Database
 from app.database import ReviewDatabase
+from app.auditing.bolt_template import SCOPE_LABELS, SIGNATURE_NOTICE, SINGLE_NOTICE
 
 
 def export_findings(db: Database, project_id: int) -> bytes:
@@ -56,6 +57,9 @@ def export_batch(db: ReviewDatabase, batch_id: str) -> bytes:
     if not batch:
         raise ValueError("审核批次不存在")
     findings = db.query("SELECT * FROM findings WHERE batch_id=? ORDER BY id", (batch_id,))
+    batch_metadata = json.loads(batch.get('summary') or '{}')
+    visual = db.query('''SELECT d.original_name,v.page,v.kind,v.state,v.method,v.confidence,v.bbox,v.details
+        FROM visual_evidence v JOIN documents d ON d.id=v.document_id WHERE v.batch_id=? ORDER BY v.id''', (batch_id,))
     documents = db.query(
         """SELECT d.*,bd.role,bd.priority FROM batch_documents bd JOIN documents d ON d.id=bd.document_id
            WHERE bd.batch_id=? ORDER BY bd.priority,d.created_at""", (batch_id,)
@@ -85,6 +89,10 @@ def export_batch(db: ReviewDatabase, batch_id: str) -> bytes:
     } for index, finding in enumerate(findings, start=1)]
     levels = ("Critical", "Major", "Minor", "Warning", "Review")
     summary = [{"指标": "审核批次", "内容": batch["name"]}, {"指标": "供应商", "内容": batch.get("supplier_name") or "未识别"},
+               {"指标": "审核范围", "内容": SCOPE_LABELS.get(batch.get('audit_scope'), '完整文件包审核')},
+               {"指标": "范围限制", "内容": SINGLE_NOTICE if batch.get('audit_scope') == 'single_document' else '仅对已覆盖WDC给出结论'},
+               {"指标": "未覆盖WDC", "内容": '、'.join(batch_metadata.get('uncovered_wdcs', []))},
+               {"指标": "签章限制", "内容": SIGNATURE_NOTICE},
                {"指标": "审核模板", "内容": batch.get("template_name") or "-"},
                {"指标": "文件数量", "内容": len(documents)},
                {"指标": "问题数量", "内容": len(findings)},
@@ -98,7 +106,7 @@ def export_batch(db: ReviewDatabase, batch_id: str) -> bytes:
         "证据": item["evidence"], "证据类型": item["evidence_type"], "实际值": item["actual"],
         "要求值": item["requirement"], "判断逻辑": item["logic"], "整改建议": item["suggestion"],
         "置信度": item["confidence"], "降级原因": downgrade_reason(item), "调用错误": item["error"], "开始时间": item["started_at"],
-        "完成时间": item["completed_at"],
+        "完成时间": item["completed_at"], "WDC": json.loads(item.get('metadata') or '{}').get('wdc', ''),
     } for item in rule_evaluations]
     output = BytesIO()
     columns = ["序号", "审核批次", "审核模板", "供应商", "问题等级", "问题类别", "文件名称", "页码", "检查项目", "实际内容",
@@ -106,8 +114,12 @@ def export_batch(db: ReviewDatabase, batch_id: str) -> bytes:
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         pd.DataFrame(rows, columns=columns).to_excel(writer, sheet_name="问题清单", index=False)
         pd.DataFrame(summary).to_excel(writer, sheet_name="审核汇总", index=False)
+        if visual:
+            pd.DataFrame(visual, columns=['original_name','page','kind','state','method','confidence','bbox','details']).rename(
+                columns={'original_name':'文件','page':'原页','kind':'检查类型','state':'识别状态','method':'方法',
+                         'confidence':'置信度','bbox':'检查区域坐标','details':'证据详情'}).to_excel(writer, sheet_name='签章证据', index=False)
         pd.DataFrame(rule_rows, columns=["序号", "审核任务", "结论", "结论说明", "证据文件", "页码", "证据", "证据类型",
-            "实际值", "要求值", "判断逻辑", "整改建议", "置信度", "降级原因", "调用错误", "开始时间", "完成时间"]).to_excel(
+            "实际值", "要求值", "判断逻辑", "整改建议", "置信度", "降级原因", "调用错误", "开始时间", "完成时间", 'WDC']).to_excel(
                 writer, sheet_name="逐条规则", index=False)
         pd.DataFrame(basis, columns=["文件名称", "类别", "角色", "优先级", "页数", "解析状态", "依据检索"]).to_excel(writer, sheet_name="审核依据", index=False)
         for sheet in writer.book.worksheets:

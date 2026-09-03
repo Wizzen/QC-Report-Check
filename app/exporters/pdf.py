@@ -27,6 +27,7 @@ from reportlab.platypus import (
 from reportlab.lib.utils import ImageReader
 
 from app.database import ReviewDatabase
+from app.auditing.bolt_template import SCOPE_LABELS, SIGNATURE_NOTICE, SINGLE_NOTICE
 from app.evidence import render_pdf_evidence_bytes
 
 
@@ -69,9 +70,14 @@ def export_batch_pdf(db: ReviewDatabase, batch_id: str) -> bytes:
         (batch_id,),
     )
     rule_evaluations = db.query(
-        "SELECT task_index,task_name,status,conclusion,error FROM rule_evaluations WHERE batch_id=? ORDER BY task_index",
+        "SELECT task_index,task_name,status,conclusion,error,source_file,metadata FROM rule_evaluations WHERE batch_id=? ORDER BY task_index",
         (batch_id,),
     )
+    for row in rule_evaluations:
+        metadata = json.loads(row.get('metadata') or '{}')
+        row['task_name'] += ' · ' + (row.get('source_file') or '批次') + (' · WDC ' + metadata['wdc'] if metadata.get('wdc') else '')
+    batch['_visual'] = db.query('''SELECT v.*,d.original_name FROM visual_evidence v JOIN documents d ON d.id=v.document_id
+        WHERE v.batch_id=? ORDER BY v.id''', (batch_id,))
     return _build_report(batch, findings, documents, rule_evaluations)
 
 
@@ -92,6 +98,12 @@ def _build_report(batch: dict[str, object], findings: list[dict[str, object]],
               for level in ("Critical", "Major", "Minor", "Warning", "Review")}
 
     story.extend(_cover(batch, findings, supplier_docs, basis_docs, counts, styles))
+    if batch.get('_visual'):
+        story.extend([PageBreak(), Paragraph('签章识别记录', styles['page_title']), Paragraph(SIGNATURE_NOTICE, styles['body'])])
+        for row in batch['_visual']:
+            detail = json.loads(row.get('details') or '{}')
+            text = f"{row['original_name']} / 第{row['page']}页 / {row['kind']} / {row['state']} / {row['method']} / 区域{row['bbox']}：{detail.get('description', '')}"
+            story.extend([Spacer(1, 3*mm), Paragraph(_safe(text), styles['body'])])
     if rule_evaluations:
         story.append(PageBreak())
         story.extend(_rule_summary(rule_evaluations, styles))
@@ -148,6 +160,12 @@ def _cover(batch: dict[str, object], findings: list[dict[str, object]],
            counts: dict[str, int], styles: dict[str, ParagraphStyle]) -> list[object]:
     supplier = str(batch.get("supplier_name") or "未识别")
     summary = _summary_text(counts, len(findings))
+    batch_summary = json.loads(str(batch.get('summary') or '{}'))
+    summary = SCOPE_LABELS.get(batch.get('audit_scope'), '完整文件包审核') + '。' + summary
+    if batch.get('audit_scope') == 'single_document':
+        summary = SINGLE_NOTICE + summary
+    if batch_summary.get('uncovered_wdcs'):
+        summary += ' 未覆盖WDC（未判合格）：' + '、'.join(batch_summary['uncovered_wdcs'])
     items: list[object] = [
         Spacer(1, 12 * mm),
         Paragraph("SUPPLIER QUALITY REVIEW", styles["eyebrow"]),

@@ -50,7 +50,7 @@ def parse_template_tasks(raw: object) -> list[dict[str, object]]:
             text = str(value).strip()
             enabled = True
         if text:
-            output.append({"text": text, "enabled": enabled})
+            output.append({**(value if isinstance(value, dict) else {}), "text": text, "enabled": enabled})
     return output
 
 
@@ -152,7 +152,8 @@ def build_expert_prompt(
 
 
 def build_rule_task_prompt(
-    task: str, documents: list[ExpertDocument], instructions: str, existing: Iterable[Finding], basis: str = ""
+    task: str, documents: list[ExpertDocument], instructions: str, existing: Iterable[Finding], basis: str = "",
+    *, compact: bool = False,
 ) -> str:
     evidence_blocks = []
     remaining = 9_000
@@ -168,6 +169,13 @@ def build_rule_task_prompt(
         if remaining <= 0:
             break
     known = [{"item": item.item, "result": item.severity, "evidence": item.source_text or item.actual} for item in existing]
+    output_format = (
+        '只返回紧凑JSON，不重复任务名，不写长段分析。r为结论，c为不超过40字的说明，f为原文件名，p为页码，'
+        'e为不超过80字的连续逐字证据，t为证据类型，s为缺失检查范围（其他情况留空），q为置信度。'
+        '\n{"r":"合格|不合格|存疑|不适用","c":"...","f":"...","p":1,"e":"...","t":"source|absence","s":"...","q":0.0}'
+        if compact else
+        f'只返回一个 JSON 对象：\n{{"task":"{task}","result":"合格|不合格|存疑|不适用","conclusion":"...","source_file":"...","page":1,"evidence":"...","evidence_type":"source|absence","checked_scope":"...","actual":"...","requirement":"...","logic":"...","suggestion":"...","confidence":0.0}}'
+    )
     return f"""你是受证据约束的供应商质量文件审核专家。本次只执行一个独立审核任务，不得顺带判断其他任务。
 
 当前审核任务：{task}
@@ -176,7 +184,7 @@ def build_rule_task_prompt(
 {instructions or FASTENER_FALLBACK_INSTRUCTIONS}
 
 所选审核依据：
-{basis[:3_000] or "未提供额外标准，不得自行补充标准值"}
+{basis[:6_000] or "未提供额外标准，不得自行补充标准值"}
 
 本地规则已发现内容（仅用于避免矛盾）：
 {json.dumps(known, ensure_ascii=False)[:3_000]}
@@ -187,11 +195,10 @@ def build_rule_task_prompt(
 {chr(10).join(evidence_blocks)}
 
 判断要求：
-1. result 只能是“合格”“不合格”“存疑”“不适用”。
-2. 不合格或存疑必须给出逐字存在于对应原页的 evidence；若判断的是文件/字段完全缺失，可使用 evidence_type="absence" 并在 checked_scope 写明检查过的文件和页面。
+1. {'r' if compact else 'result'} 只能是“合格”“不合格”“存疑”“不适用”。
+2. 不合格或存疑必须给出逐字存在于对应原页的 {'e' if compact else 'evidence'}；若判断的是文件/字段完全缺失，可使用 {'t' if compact else 'evidence_type'}="absence" 并在 {'s' if compact else 'checked_scope'} 写明检查过的文件和页面。
 3. 不得引用输入之外的标准，不得编造页码、数值或证据。
-4. 只返回一个 JSON 对象：
-{{"task":"{task}","result":"合格|不合格|存疑|不适用","conclusion":"...","source_file":"...","page":1,"evidence":"...","evidence_type":"source|absence","checked_scope":"...","actual":"...","requirement":"...","logic":"...","suggestion":"...","confidence":0.0}}
+4. {output_format}
 """
 
 
@@ -244,6 +251,10 @@ def rule_evaluation_from_llm(
         result = "存疑"
         downgrade_reasons.append("local_feedback_false_positive_pattern")
     conclusion = str(payload.get("conclusion") or payload.get("c") or "")
+    if re.search(r'签字|签名|签章|印章|signature|stamp', task, re.I) and result in {'不合格', '存疑'}:
+        result = '存疑'
+        conclusion = '签章需原页视觉确认；文字提取结果不能证明签章缺失'
+        downgrade_reasons.append('visual_evidence_required')
     if evidence_type == "unlocated":
         conclusion = (conclusion or "模型发现疑点") + "（证据未能自动定位，需人工复核）"
     if downgrade_reasons:
@@ -269,7 +280,7 @@ def rule_evaluation_from_llm(
         evaluation["actual"], evaluation["requirement"], filename, page or 1, evidence,
         logic=evaluation["logic"], suggestion=evaluation["suggestion"] or "请人工复核并要求供应商补充证据。",
         confidence=confidence, metadata={"origin": "llm_rule_task", "result": result, "original_result": original_result,
-            "evidence_type": evidence_type, "downgrade_reasons": downgrade_reasons,
+            "evidence_type": evidence_type, "downgrade_reasons": list(downgrade_reasons),
             "review_priority": "high" if bool((feedback_policy or {}).get("prioritize_review")) else "normal"},
         rule_code=task, decision_confidence=confidence,
     )
@@ -379,7 +390,7 @@ def findings_from_llm(payload: dict[str, object], documents: list[ExpertDocument
 
 def _document_type(document: ExpertDocument) -> str:
     haystack = f"{document.filename}\n{document.text}".casefold()
-    if re.search(r"\bcoc\b|certificate of conformance|certificate of conformity|合格证", haystack):
+    if re.search(r"\bcoc\b|certificate of conformance|certificate of conformity|certificate of compliance|合格证", haystack):
         return "COC"
     if re.search(r"certificate of inspection|\bcoi\b", haystack):
         return "COI"

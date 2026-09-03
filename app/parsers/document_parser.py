@@ -55,8 +55,8 @@ def _extract_pdf_tables(page: pymupdf.Page) -> str:
     lines: list[str] = []
     for table in tables:
         for row in table.extract():
-            cells = [" ".join(str(cell).split()) for cell in row if cell and str(cell).strip()]
-            if cells:
+            cells = [" ".join(str(cell).split()) if cell is not None else "" for cell in row]
+            if any(cells):
                 lines.append("[TABLE_ROW] " + " || ".join(cells))
     return "\n".join(lines)
 

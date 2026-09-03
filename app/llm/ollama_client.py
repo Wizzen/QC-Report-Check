@@ -71,11 +71,14 @@ def parse_json_object(text: str) -> dict[str, Any]:
     try:
         value = json.loads(cleaned)
     except json.JSONDecodeError:
-        start, end = cleaned.find("{"), cleaned.rfind("}")
-        if start < 0 or end <= start:
+        start = cleaned.find("{")
+        if start < 0 or cleaned.startswith('['):
             raise
-        value = json.loads(cleaned[start:end + 1])
+        # Decode one complete outer object. Never slice at a closing brace in
+        # a nested object or quoted evidence and accidentally accept truncation.
+        value, end = json.JSONDecoder().raw_decode(cleaned, start)
+        if cleaned[end:].lstrip().startswith(('{', '[')):
+            raise ValueError('LLM 返回多个 JSON 结果，无法确定结论')
     if not isinstance(value, dict):
         raise ValueError("JSON 根节点必须是对象")
     return value
-

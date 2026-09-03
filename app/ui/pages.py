@@ -4,6 +4,7 @@ import html
 import inspect
 import json
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,6 +15,7 @@ import streamlit as st
 from app.exporters import export_batch, export_batch_pdf
 from app.config import ROOT
 from app.auditing.expert_review import parse_template_tasks
+from app.auditing.bolt_template import BOLT_ENGINE, SCOPE_LABELS, SINGLE_NOTICE, SIGNATURE_NOTICE
 from app.integrations import LLMClient, MinerUClient
 from app.integrations.settings import mask_secret
 from app.ui.context import get_context
@@ -31,12 +33,23 @@ def start_review_page() -> None:
     template_options = {row["name"]: row["id"] for row in templates}
     chosen_name = st.selectbox("审核模板", list(template_options), key="review_template")
     template_id = template_options.get(chosen_name)
+    chosen_template = next((row for row in templates if row['id'] == template_id), {})
+    bolt_mode = chosen_template.get('engine_binding') == BOLT_ENGINE
+    scope_label = st.selectbox('审核范围', list(SCOPE_LABELS.values()), disabled=not bolt_mode,
+                               help='新螺栓检验模版支持单文件预检查；完整包审核为默认。')
+    audit_scope = next(key for key, value in SCOPE_LABELS.items() if value == scope_label) if bolt_mode else 'full_package'
+    if audit_scope == 'single_document':
+        st.warning(SINGLE_NOTICE)
+    if bolt_mode:
+        st.caption(SIGNATURE_NOTICE)
     review_mode_label = st.segmented_control(
         "审核方式", ["自适应审核", "思考模式深度复核"], default="自适应审核",
         key="review_mode", width="stretch",
     )
     review_mode = "deep" if review_mode_label == "思考模式深度复核" else "adaptive"
-    if review_mode == "adaptive":
+    if bolt_mode:
+        st.caption("新模板按文件与 WDC 分配规则；确定性检查不调用模型，签章单独读取原页图片。深度选项仅影响文字规则。")
+    elif review_mode == "adaptive":
         st.caption("每个必检项只调用一次模型，使用紧凑 JSON；无法定位的证据自动转人工复核。服务支持连续批处理时可启用双路并行。")
     else:
         st.caption("每一条必检项都启用思考模式，速度较慢，并会占用更多上下文和显存。")
@@ -45,11 +58,14 @@ def start_review_page() -> None:
     project_models_safe_mode = "qwen3.8" in settings.llm_model.casefold()
     parallel_enabled = st.toggle(
         "启用并行 LLM 审核", value=False if project_models_safe_mode else settings.llm_concurrency > 1,
-        key="review_parallel_enabled", disabled=project_models_safe_mode,
+        key="review_parallel_enabled", disabled=project_models_safe_mode or bolt_mode,
         help="Project Models 的 Qwen3.8 连续批处理当前不稳定，已自动锁定安全单路。" if project_models_safe_mode
         else "只并行执行彼此独立的模板规则；文件解析、确定性规则与结果写入仍按安全顺序执行。",
     )
-    if project_models_safe_mode:
+    if bolt_mode:
+        review_concurrency = 1
+        st.caption("新模板当前采用单路执行，避免文字与视觉请求竞争本机显存；并行加速需另做压力测试。")
+    elif project_models_safe_mode:
         review_concurrency = 1
         st.caption("已识别 Project Models Qwen3.8：自动使用安全单路，避免生成服务出现 tuple.shape HTTP 500。")
     elif parallel_enabled:
@@ -96,6 +112,7 @@ def start_review_page() -> None:
                     batch_id = ctx.service.create_review(
                         template_id, selected_ids, supplier_files, supplemental or [],
                         review_mode=review_mode, llm_concurrency=review_concurrency,
+                        **({'audit_scope': audit_scope} if 'audit_scope' in create_parameters else {}),
                     )
                 else:
                     # Streamlit may retain a ReviewService instance created before
@@ -263,6 +280,14 @@ def review_records_page() -> None:
     if batch["status"] != "completed":
         batch_status_card(batch_id)
     _render_download_card(batch_id)
+    batch_summary = json.loads(batch.get('summary') or '{}')
+    st.caption('审核范围：' + SCOPE_LABELS.get(batch.get('audit_scope', 'full_package'), '完整文件包审核'))
+    if batch.get('audit_scope') == 'single_document':
+        st.warning(SINGLE_NOTICE)
+    if batch_summary.get('uncovered_wdcs'):
+        st.warning('未覆盖WDC（未判合格）：' + '、'.join(batch_summary['uncovered_wdcs']))
+    if batch_summary.get('vision_status'):
+        st.caption('视觉状态：' + batch_summary['vision_status'] + '。' + SIGNATURE_NOTICE)
     detail_view = st.segmented_control("批次详情", ["人工复核", "全部规则", "文件证据", "处理记录"], default="人工复核", key=f"batch_view_{batch_id}")
     if detail_view == "人工复核": _render_findings(batch_id)
     elif detail_view == "全部规则": _render_rule_evaluations(batch_id)
@@ -429,9 +454,20 @@ def _confirm_delete(batch_id: str, name: str, permanent: bool) -> None:
             ctx.db.soft_delete_batch(batch_id); st.toast("已移到回收站"); st.rerun()
 
 
+def _finding_review_rank(row: dict) -> tuple:
+    try:
+        priority = json.loads(row.get('metadata') or '{}').get('review_priority') == 'high'
+    except (TypeError, ValueError, AttributeError):
+        priority = False
+    # Learning changes order within a severity, never the severity itself.
+    severity = {'Critical': 0, 'Major': 1, 'Minor': 2, 'Warning': 3, 'Review': 4}.get(row['severity'], 5)
+    return severity, not priority, row['id']
+
+
 def _render_findings(batch_id: str) -> None:
     ctx = get_context()
     findings = ctx.db.query("SELECT * FROM findings WHERE batch_id=? ORDER BY CASE severity WHEN 'Critical' THEN 1 WHEN 'Major' THEN 2 WHEN 'Minor' THEN 3 WHEN 'Warning' THEN 4 ELSE 5 END,id", (batch_id,))
+    findings.sort(key=_finding_review_rank)
     documents = ctx.db.query(
         """SELECT d.original_name,d.detected_type FROM batch_documents bd JOIN documents d ON d.id=bd.document_id
            WHERE bd.batch_id=? AND bd.role='supplier' ORDER BY d.created_at""", (batch_id,),
@@ -453,7 +489,7 @@ def _render_findings(batch_id: str) -> None:
                             source_file=manual_file, source_page=int(manual_page), evidence=manual_evidence,
                             requirement=manual_requirement, service_fingerprint=_service_fingerprint(ctx),
                         )
-                        st.toast("漏检问题已补充，并记录为学习样本", icon=":material/check_circle:")
+                        st.toast("漏检问题已补充并留存审计记录；可可靠匹配规则版本的反馈才参与自动校准", icon=":material/check_circle:")
                         st.rerun()
                     except Exception as exc:
                         st.error(str(exc))
@@ -481,6 +517,7 @@ def _render_findings(batch_id: str) -> None:
         st.markdown("**待复核问题队列**")
         queue_frame = pd.DataFrame([{
             "ID": row["id"], "等级": row["severity"], "检查项": row["item"],
+            "复核顺序": "优先" if not _finding_review_rank(row)[1] else "常规",
             "文件/页": f"{row['source_file']} / {row['source_page']}", "状态": row["status"],
         } for row in visible])
         table_event = st.dataframe(
@@ -601,11 +638,13 @@ def _render_learning_panel() -> None:
         if patterns:
             st.dataframe(pd.DataFrame([{
                 "模板": row["template"], "规则": row["rule_code"], "文档类型": row["document_type"] or "通用",
+                "模型/规则指纹": row['model_fingerprint'][:12],
                 "样本": row["sample_count"], "距激活": row["remaining"],
                 "模式": "高误报降级" if row["downgrade_llm_issue"] else ("高确认优先" if row["prioritize_review"] else "观察中"),
                 "状态": "启用" if row["enabled"] else "已暂停",
             } for row in patterns]), hide_index=True, width="stretch")
-            lookup = {f"{row['rule_code']} · {row['document_type'] or '通用'} · {row['sample_count']}条": row for row in patterns}
+            lookup = {f"{row['template']} · {row['rule_code']} · {row['document_type'] or '通用'} · {row['sample_count']}条 · 模式{index}": row
+                      for index, row in enumerate(patterns, 1)}
             chosen = lookup[st.selectbox("管理学习模式", list(lookup), key="learning_pattern")]
             controls = st.columns(2)
             if controls[0].button("暂停" if chosen["enabled"] else "恢复", key="toggle_learning_pattern", width="stretch"):
@@ -726,6 +765,19 @@ def _render_batch_files(batch_id: str) -> None:
         page_text = next((str(item["text"]) for item in pages if int(item["page"]) == page), "")
         st.text_area("提取内容", page_text, height=420, disabled=True, key=f"batch_text_{batch_id}_{file_id}_{page}")
         st.caption(f"OCR：{row['ocr_status']} · 依据检索：本地关键词")
+        observations = ctx.db.query('SELECT * FROM visual_evidence WHERE batch_id=? AND document_id=? AND page=?',
+                                    (batch_id, file_id, page))
+        if observations:
+            with st.expander('签章检查区域与状态', expanded=True):
+                st.caption(SIGNATURE_NOTICE)
+                for observation in observations:
+                    detail = json.loads(observation['details'])
+                    state_label = {'present': '已识别', 'absent': '明确未见', 'unknown': '需人工确认', 'unfilled': '未填字段'}.get(observation['state'], observation['state'])
+                    st.write(f"{observation['kind']}：{state_label} · {detail.get('description', '')}")
+                    if path.suffix.lower() == '.pdf' and path.is_file() and len(detail.get('bbox', [])) == 4:
+                        from app.ui.document_preview import render_pdf_region
+                        st.image(render_pdf_region(str(path), path.stat().st_mtime_ns, page, tuple(detail['bbox'])),
+                                 caption='程序检查区域（不代表已验证签署身份）')
         if path.is_file():
             st.download_button("下载原文件", read_original_file(str(path), path.stat().st_mtime_ns), str(row["original_name"]),
                                str(row.get("mime_type") or "application/octet-stream"), icon=":material/download:",
@@ -903,14 +955,15 @@ def templates_page() -> None:
     basis = ctx.db.query("SELECT id,original_name FROM documents WHERE library_code='basis' AND parse_status='completed' ORDER BY created_at DESC")
     basis_labels = {row["original_name"]: row["id"] for row in basis}
     attached = [] if not selected else [row["document_id"] for row in ctx.db.query("SELECT document_id FROM template_basis WHERE template_id=?", (selected["id"],))]
-    st.info("每个启用的表格行都是一次独立 LLM 审核。任务会按系统设置的并发数同时执行，完成后统一汇总。", icon=":material/account_tree:")
+    st.info("启用行按绑定规则执行。新螺栓模板使用确定性、原页视觉和文字审核，并按文件/WDC分组；禁用行不执行。", icon=":material/account_tree:")
     token = str(selected["id"] if selected else "new")
     rows_key = f"template_task_rows_{token}"
     revision_key = f"template_task_revision_{token}"
     select_state_key = f"template_task_select_all_last_{token}"
     if rows_key not in st.session_state:
         st.session_state[rows_key] = [
-            {"选择": False, "启用": bool(row["enabled"]), "必检项目": str(row["text"])}
+            {"选择": False, "启用": bool(row["enabled"]), "必检项目": str(row["text"]),
+             '规则ID': row.get('rule_id', ''), '判断标准': row.get('criterion', '')}
             for row in parse_template_tasks(selected["required_items"] if selected else "[]")
         ]
         st.session_state[revision_key] = 0
@@ -923,17 +976,17 @@ def templates_page() -> None:
         st.session_state[rows_key] = [{**row, "选择": select_all} for row in st.session_state[rows_key]]
         st.session_state[select_state_key] = select_all
         st.session_state[revision_key] += 1
-    task_frame = pd.DataFrame(st.session_state[rows_key], columns=["选择", "启用", "必检项目"])
+    task_frame = pd.DataFrame(st.session_state[rows_key], columns=["选择", "启用", "必检项目", '规则ID', '判断标准'])
     edited_tasks = st.data_editor(
-        task_frame, hide_index=True, width="stretch", num_rows="dynamic",
+        task_frame, hide_index=True, width="stretch", num_rows="dynamic", disabled=['规则ID'],
         key=f"template_task_editor_{token}_{st.session_state[revision_key]}",
         column_config={
             "选择": st.column_config.CheckboxColumn("选择", help="用于批量删除"),
-            "启用": st.column_config.CheckboxColumn("启用", help="启用后，本项会独立调用一次 LLM"),
+            "启用": st.column_config.CheckboxColumn("启用", help="启用后执行该项绑定的检查规则"),
             "必检项目": st.column_config.TextColumn("必检项目", required=True, width="large"),
         },
     )
-    current_rows = edited_tasks.fillna({"选择": False, "启用": True, "必检项目": ""}).to_dict("records")
+    current_rows = edited_tasks.fillna({"选择": False, "启用": True, "必检项目": "", "规则ID": "", "判断标准": ""}).to_dict("records")
     st.session_state[rows_key] = current_rows
     with st.container(horizontal=True):
         if st.button("增加一项", icon=":material/add:", key=f"template_add_task_{token}"):
@@ -960,8 +1013,12 @@ def templates_page() -> None:
     enabled = st.toggle("启用", value=bool(selected["enabled"]) if selected else True, key=f"template_enabled_{token}")
     is_default = st.toggle("设为默认模板", value=bool(selected["is_default"]) if selected else False, key=f"template_default_{token}")
     if st.button("保存模板", type="primary", icon=":material/save:", key=f"template_save_{token}"):
+        original_rules = {str(row.get('rule_id', '')): row for row in parse_template_tasks(selected['required_items'] if selected else '[]')}
         task_items = [
-            {"text": str(row.get("必检项目") or "").strip(), "enabled": bool(row.get("启用"))}
+            {**original_rules.get(str(row.get('规则ID') or ''), {}),
+             **({'rule_id': row.get('规则ID') or 'CUSTOM-' + uuid.uuid4().hex[:8], 'criterion': str(row.get('判断标准') or '')}
+                if selected and selected.get('engine_binding') == BOLT_ENGINE else {}),
+             "text": str(row.get("必检项目") or "").strip(), "enabled": bool(row.get("启用"))}
             for row in current_rows if str(row.get("必检项目") or "").strip()
         ]
         if not name.strip():
