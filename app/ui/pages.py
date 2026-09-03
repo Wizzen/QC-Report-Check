@@ -288,6 +288,9 @@ def review_records_page() -> None:
         st.warning('未覆盖WDC（未判合格）：' + '、'.join(batch_summary['uncovered_wdcs']))
     if batch_summary.get('vision_status'):
         st.caption('视觉状态：' + batch_summary['vision_status'] + '。' + SIGNATURE_NOTICE)
+    if batch_summary.get('model_identity'):
+        st.caption('本批次实际模型：' + batch_summary['model_identity'] +
+                   ' · 指纹 ' + str(batch_summary.get('model_fingerprint') or '未记录'))
     detail_view = st.segmented_control("批次详情", ["人工复核", "全部规则", "文件证据", "处理记录"], default="人工复核", key=f"batch_view_{batch_id}")
     if detail_view == "人工复核": _render_findings(batch_id)
     elif detail_view == "全部规则": _render_rule_evaluations(batch_id)

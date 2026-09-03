@@ -5,6 +5,7 @@ These are presence observations, not cryptographic or legal validation.
 from __future__ import annotations
 
 import hashlib
+import math
 import re
 import secrets
 from io import BytesIO
@@ -16,14 +17,47 @@ from app.integrations.settings import ensure_url_allowed
 
 SIGN_ANCHOR = re.compile(r"signature|signed by|authorized by|签字|签名|签署", re.I)
 
+_CONFIDENCE_LABELS = {
+    "high": .95, "高": .95, "medium": .70, "中": .70,
+    "low": .30, "低": .30,
+}
+
+
+def normalize_confidence(value) -> tuple[float, bool]:
+    """Normalize common vision-model confidence formats without failing a page."""
+    if value is None or isinstance(value, bool):
+        return 0.0, False
+    if isinstance(value, str):
+        text = value.strip().casefold()
+        if text in _CONFIDENCE_LABELS:
+            return _CONFIDENCE_LABELS[text], True
+        try:
+            number = float(text[:-1]) / 100 if text.endswith("%") else float(text)
+        except ValueError:
+            return 0.0, False
+    elif isinstance(value, (int, float)):
+        number = float(value)
+    else:
+        return 0.0, False
+    return (number, True) if math.isfinite(number) and 0 <= number <= 1 else (0.0, False)
+
 
 class LocalVision:
     def __init__(self, client):
         self.client = client
         self.available = None
         self.reason = "尚未验证图片能力"
+        identity = client.model_identity() if callable(getattr(client, "model_identity", None)) else client.settings.llm_model
+        self.model_identity = str(identity or "未识别")
         self.fingerprint = hashlib.sha256(
-            f"{client.settings.llm_base_url}|{client.settings.llm_model}|signature-v1".encode()
+            f"{client.settings.llm_base_url}|{self.model_identity}|signature-v2".encode()
+        ).hexdigest()[:24]
+
+    def _refresh_model_identity(self) -> None:
+        identity = self.client.model_identity() if callable(getattr(self.client, "model_identity", None)) else self.client.settings.llm_model
+        self.model_identity = str(identity or "未识别")
+        self.fingerprint = hashlib.sha256(
+            f"{self.client.settings.llm_base_url}|{self.model_identity}|signature-v2".encode()
         ).hexdigest()[:24]
 
     def probe(self) -> bool:
@@ -41,6 +75,7 @@ class LocalVision:
                 'Read the six characters in this image. Return only {"code":"..."}.',
                 images=[data.getvalue()], thinking=False, retries=0, max_tokens=60, timeout_seconds=35,
             )
+            self._refresh_model_identity()
             self.available = str(result.get("code", "")).strip() == token
             self.reason = "图片读取验证通过" if self.available else "图片答案不正确，视觉识别未启用"
         except Exception as exc:
@@ -62,13 +97,17 @@ class LocalVision:
             raw = self.client.generate_json(prompt, images=[image], retries=0, thinking=False,
                                             timeout_seconds=60, max_tokens=180)
             state = raw.get("state", "unknown")
-            confidence = float(raw.get("confidence", 0))
-            if state not in {"present", "absent", "unknown"} or not 0 <= confidence <= 1:
+            raw_confidence = raw.get("confidence", 0)
+            confidence, confidence_valid = normalize_confidence(raw_confidence)
+            if state not in {"present", "absent", "unknown"} or not confidence_valid:
                 state, confidence = "unknown", 0.0
             if confidence < .90 or (state == "absent" and kind == "signature" and not anchored):
                 state = "unknown"
-            return {"state": state, "confidence": confidence,
-                    "description": str(raw.get("description", ""))[:400]}
+            description = str(raw.get("description", ""))[:400]
+            if not confidence_valid:
+                description = (description + "；模型置信度格式无效，已转人工复核").strip("；")
+            return {"state": state, "confidence": confidence, "description": description,
+                    "confidence_normalized": isinstance(raw_confidence, str) and confidence_valid}
         except Exception as exc:
             return {"state": "unknown", "confidence": 0.0, "description": f"视觉识别失败：{str(exc)[:200]}"}
 
@@ -119,12 +158,14 @@ def inspect_document(document, vision: LocalVision, check_cancel=lambda: None, *
                 image = page.get_pixmap(matrix=pymupdf.Matrix(1.6, 1.6), clip=region).tobytes("png")
                 observations.append({"page": index, "bbox": list(region), "kind": "signature",
                     "method": "local_vision", "anchored": bool(anchors),
-                    **vision.inspect(image, "signature", bool(anchors)), "model_fingerprint": vision.fingerprint})
+                    **vision.inspect(image, "signature", bool(anchors)), "model_fingerprint": vision.fingerprint,
+                    "model_identity": getattr(vision, "model_identity", "")})
             if 'stamp' in kinds:
                 check_cancel()
                 image = page.get_pixmap(matrix=pymupdf.Matrix(1.25, 1.25)).tobytes("png")
                 observations.append({"page": index, "bbox": list(page.rect), "kind": "stamp", "method": "local_vision",
-                    **vision.inspect(image, "stamp", False), "model_fingerprint": vision.fingerprint})
+                    **vision.inspect(image, "stamp", False), "model_fingerprint": vision.fingerprint,
+                    "model_identity": getattr(vision, "model_identity", "")})
     return observations
 
 

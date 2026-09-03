@@ -150,20 +150,49 @@ def table_checks(document, samples=False):
             if len(header) >= 2:
                 columns = header
                 continue
+            if (columns and cells and cells[0]
+                    and all(index >= len(cells) or not cells[index] for index in columns.values())):
+                # A titled subsection or narrative row ends the previous
+                # table's column mapping. Do not reuse Standard/Result offsets
+                # in the following chemical composition or notes table.
+                columns = {}
+                continue
             keys = ("sample", "pass") if samples else ("spec", "actual")
             if not all(key in columns and columns[key] < len(cells) for key in keys):
                 continue
             first, second = [cells[columns[key]] for key in keys]
-            if not first or not second:
-                uncertain.append((page.page, line))
-                continue
             if samples:
+                if not first and not second:
+                    continue
+                # '/', dashes and textual results do not belong to the
+                # deterministic Sample/Pass numeric rule.
+                if not first.isdigit() and not second.isdigit():
+                    continue
                 if not first.isdigit() or not second.isdigit():
                     uncertain.append((page.page, line)); continue
                 failed = int(first) != int(second) or int(first) <= 0
             else:
-                limits, actual = numeric_range(first), numeric_range(second)
-                if not limits or not actual:
+                # C5.2 deliberately handles only explicit simple numeric
+                # specifications. Headers, narrative rows, '/', chemical
+                # columns and compound formulae are outside this evaluator;
+                # they must not inflate the unresolved-row count.
+                limits = numeric_range(first)
+                if not limits:
+                    continue
+                actual = numeric_range(second)
+                next_semantic_column = min(
+                    (index for key, index in columns.items() if key != 'actual' and index > columns['actual']),
+                    default=len(cells),
+                )
+                if (not actual and columns['actual'] + 1 < len(cells)
+                        and columns['actual'] + 1 < next_semantic_column):
+                    # Merged PDF cells occasionally shift Result one position
+                    # to the right while preserving the visible table layout.
+                    shifted = cells[columns['actual'] + 1]
+                    actual = numeric_range(shifted)
+                    if actual:
+                        second = shifted
+                if not actual:
                     uncertain.append((page.page, line)); continue
                 failed = actual[0] < limits[0] or actual[1] > limits[1]
             checked += 1
@@ -173,6 +202,21 @@ def table_checks(document, samples=False):
                     requirement=first, source_file=document.filename, source_page=page.page, source_text=line,
                     logic=f"按同一表头对应列比较：{first} / {second}", metadata={"origin": "deterministic"}))
     return findings, checked, uncertain
+
+
+def product_marking(document):
+    """Return a document-level product marking field, never a seal/signature."""
+    pattern = re.compile(r"(?im)^\s*(?:product\s*)?(?:marking|产品印记|印记)\s*[:：]\s*([^\n|]+)")
+    for page in document.pages:
+        match = pattern.search(page.text)
+        if not match:
+            continue
+        # PDF text layers often place the next label on the same logical line
+        # separated by a wide run of spaces (e.g. "Marking: JDF 8.8  Order No").
+        value = re.split(r"\s{2,}", match.group(1).strip(), maxsplit=1)[0].strip().strip('-_/ ')
+        if value:
+            return value, page.page, match.group(0).strip()
+    return '', 1, ''
 
 
 def run_bolt_audit(service, batch_id):
@@ -197,6 +241,11 @@ def run_bolt_audit(service, batch_id):
         service._check_cancel(batch_id)
         rule, docs = task.rule, task.documents
         engine = rule.get('evaluator', 'llm')
+        # Existing batch snapshots may predate the deterministic C5.3 engine.
+        # Bind by stable rule id so retries receive the accuracy fix without
+        # rewriting their historical evidence.
+        if str(rule.get('rule_id')) == 'C5.3':
+            engine = 'marking'
         name = rule['text']
         basis = service._basis_context(batch_id, [], name)
         status, conclusion, items, extra = '合格', '', [], {}
@@ -252,6 +301,17 @@ def run_bolt_audit(service, batch_id):
         elif engine == 'wdc':
             status = '合格' if wdcs[source.filename] else '存疑'
             conclusion = '已识别WDC：' + ','.join(sorted(wdcs[source.filename])) if status == '合格' else 'WDC未能可靠提取，请确认部件归属'
+        elif engine == 'marking':
+            value, marking_page, marking_evidence = product_marking(source)
+            if value:
+                has_explicit_basis = bool(re.search(r'(?i)\bmarking\b|产品印记|印记要求', basis or ''))
+                if has_explicit_basis:
+                    status, conclusion = '存疑', f'已识别产品Marking：{value}；采购依据包含印记要求，需确认目标值是否一致'
+                else:
+                    status, conclusion = '合格', f'已识别产品Marking：{value}；未发现采购依据指定目标印记'
+                extra['marking'] = {'value': value, 'page': marking_page, 'evidence': marking_evidence}
+            else:
+                status, conclusion = '存疑', '未定位明确的产品Marking/印记字段；公司印章和签名不作为产品印记证据'
         elif engine == 'pages':
             conclusion = f'实际解析 {len(source.pages)} 页；无印刷页码不等于缺页'
             declared = re.findall(r'page\s+\d+\s+of\s+(\d+)', source.text, re.I)
@@ -363,4 +423,5 @@ def run_bolt_audit(service, batch_id):
             merged[key] = item
     return list(merged.values()), {**coverage, 'audit_scope': batch['audit_scope'],
         'scope_notice': SINGLE_NOTICE if batch['audit_scope'] == 'single_document' else '完整文件包审核；仅对覆盖的WDC给出结论',
-        'signature_notice': SIGNATURE_NOTICE, 'vision_status': vision.reason}
+        'signature_notice': SIGNATURE_NOTICE, 'vision_status': vision.reason,
+        'model_identity': vision.model_identity, 'model_fingerprint': vision.fingerprint}

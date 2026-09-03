@@ -61,6 +61,7 @@ class LLMClient:
         self._generation_lock = Lock()
         self._force_serial_generation = False
         self._project_models: bool | None = None
+        self._runtime_model_identity = ""
         self._lm_studio_native: bool | None = None
         ensure_url_allowed(settings.llm_base_url, settings.allow_remote)
 
@@ -119,6 +120,15 @@ class LLMClient:
                         **_network_options(endpoint),
                     )
                     body = response.json() if response.status_code == 200 else {}
+                    if isinstance(body, dict):
+                        runtime_model = str(
+                            body.get("proxy_model") or body.get("loaded_model") or body.get("model") or ""
+                        ).strip()
+                        if runtime_model:
+                            # Keep only the model name when a local service reports
+                            # an absolute path. This is enough for audit traceability
+                            # without persisting a private machine path.
+                            self._runtime_model_identity = Path(runtime_model).name
                     self._project_models = bool(
                         isinstance(body, dict)
                         and "proxy_model" in body
@@ -132,6 +142,13 @@ class LLMClient:
             self._force_serial_generation = True
             return 1
         return 2
+
+    def model_identity(self) -> str:
+        """Return the best locally observable model identity for audit records."""
+        # This accessor must never introduce a network dependency merely to
+        # construct an audit helper. generate_json/resolve_model will populate
+        # _resolved_model before a real model response is recorded.
+        return self._runtime_model_identity or self._resolved_model or "自动发现"
 
     def _generate_lm_studio_json(self, prompt: str, model: str, thinking: bool | str,
                                  timeout_seconds: int, max_tokens: int | None) -> dict[str, Any]:

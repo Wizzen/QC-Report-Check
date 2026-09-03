@@ -134,6 +134,19 @@ def test_feedback_never_suppresses_deterministic_failure(service):
     assert json.loads(finding['metadata'])['origin'] == 'deterministic'
 
 
+def test_product_marking_rule_uses_deterministic_field_for_old_snapshot(service):
+    rule = {'rule_id':'C5.3','text':'印记要求与实测内容','enabled':True,
+            'evaluator':'llm','scope':'document','criterion':'旧版规则快照'}
+    batch, _ = setup_batch(service, rule, 'Marking: JDF 8.8\nQuality Control Manager')
+    with patch('app.auditing.bolt_audit.LLMClient.generation_concurrency_limit',return_value=1), \
+         patch('app.auditing.bolt_audit.LLMClient.generate_json') as generate:
+        service.process_batch(batch)
+    result = service.db.one('SELECT status,conclusion,metadata FROM rule_evaluations WHERE batch_id=?',(batch,))
+    assert result['status'] == '合格'
+    assert 'JDF 8.8' in result['conclusion']
+    generate.assert_not_called()
+
+
 def test_high_confirmation_only_prioritizes_review_and_notes_never_enter_prompt(service):
     rule = {'rule_id':'CHECK','text':'数据对比','enabled':True,'evaluator':'llm','scope':'document'}
     batch, identity = setup_batch(service,rule)

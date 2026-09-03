@@ -9,10 +9,10 @@ from unittest.mock import Mock, patch
 import pymupdf
 import pytest
 
-from app.auditing.bolt_audit import coverage_for, document_wdcs, evidence_documents, scoped_tasks, seal_requirement, table_checks
+from app.auditing.bolt_audit import coverage_for, document_wdcs, evidence_documents, product_marking, scoped_tasks, seal_requirement, table_checks
 from app.auditing.bolt_template import BOLT_ENGINE, BOLT_TEMPLATE_NAME, EXTRACTION_VERSION, bolt_rules
 from app.auditing.expert_review import ExpertDocument, parse_template_tasks, rule_evaluation_from_llm
-from app.auditing.signatures import LocalVision, aggregate_observations, inspect_document
+from app.auditing.signatures import LocalVision, aggregate_observations, inspect_document, normalize_confidence
 from app.auditing.v2_service import ReviewService
 from app.database import ReviewDatabase
 from app.integrations import ConfigStore
@@ -88,6 +88,25 @@ def test_visual_confidence_and_region_guards(state, confidence, anchored, expect
     vision = LocalVision(client)
     vision.available = True
     assert vision.inspect(b'fixture', 'signature', anchored)['state'] == expected
+
+
+@pytest.mark.parametrize('raw,expected,valid', [
+    ('high', .95, True), ('HIGH', .95, True), ('95%', .95, True),
+    ('0.91', .91, True), ('medium', .70, True), ('unknown-label', 0, False),
+    (True, 0, False), (float('nan'), 0, False),
+])
+def test_visual_confidence_normalizes_labels_without_crashing(raw, expected, valid):
+    assert normalize_confidence(raw) == (expected, valid)
+
+
+def test_high_label_can_confirm_anchored_signature():
+    client = SimpleNamespace(settings=SimpleNamespace(llm_base_url='http://127.0.0.1:8080/v1', llm_model='local'),
+        generate_json=Mock(return_value={'state':'present','confidence':'high','description':'visible signature'}))
+    vision = LocalVision(client)
+    vision.available = True
+    result = vision.inspect(b'fixture', 'signature', True)
+    assert result['state'] == 'present' and result['confidence'] == .95
+    assert result['confidence_normalized'] is True
 
 
 def test_cross_page_header_retained_without_shifting_empty_values():
@@ -205,6 +224,23 @@ def test_real_numeric_and_sample_failures_are_not_suppressed():
     text = '[TABLE_ROW] Item || Standard || Result || Sample || Pass\n[TABLE_ROW] Length || 9-11 || 12 || 15 || 14'
     assert table_checks(doc('MTR.pdf', text))[0][0].severity == 'Major'
     assert table_checks(doc('MTR.pdf', text), samples=True)[0][0].severity == 'Major'
+
+
+def test_numeric_rule_skips_non_numeric_rows_and_repairs_one_shifted_result_cell():
+    text = '\n'.join([
+        '[TABLE_ROW] Item ||  || Standard || Result ||  || Sample || Pass',
+        '[TABLE_ROW] Visual ||  || ----- || OK ||  || 20 || 20',
+        '[TABLE_ROW] Impact ||  || / || / ||  || / || /',
+        '[TABLE_ROW] Thickness ||  || min 5 ||  || 9.65-11.5 || 20 || 20',
+        '[TABLE_ROW] Narrative ||  ||  ||  ||  ||  || ',
+    ])
+    findings, checked, uncertain = table_checks(doc('MTR.pdf', text))
+    assert not findings and checked == 1 and not uncertain
+
+
+def test_product_marking_uses_marking_field_not_signature_or_seal():
+    assert product_marking(doc('MTR.pdf', 'Marking: JDF 8.8\nSignature: Lee\nCompany seal'))[0] == 'JDF 8.8'
+    assert not product_marking(doc('MTR.pdf', 'Signature: Lee\nCompany seal'))[0]
 
 
 def test_seal_requires_explicit_requirement_not_language_or_logo():
